@@ -11,7 +11,7 @@ TOKEN = os.getenv("TOKEN")
 SELLAUTH_API_KEY = os.getenv("SELLAUTH_API_KEY")
 SELLAUTH_SHOP_ID = os.getenv("SELLAUTH_SHOP_ID")
 LOGS_CHANNEL_ID = 1456619335014547549  # Canal de logs
-OWNER_ROLE_ID = 1456619228915568671  # Ahora es un rol de owner
+OWNER_ROLE_ID = 1456619228915568671  # Rol de owner
 
 # --- BOT ---
 intents = discord.Intents.default()
@@ -43,24 +43,13 @@ async def get_product(pid):
     status, raw, js = await request("GET", url)
     return js.get("data") if isinstance(js, dict) else js
 
-async def get_variants(pid):
-    p = await get_product(pid)
-    if not p: return []
-    if isinstance(p.get("variants"), list) and p["variants"]:
-        return p["variants"]
-    for k in ("variant", "default_variant"):
-        v = p.get(k)
-        if isinstance(v, dict) and v.get("id"):
-            return [v]
-    return []
-
-async def get_stock(pid, vid):
-    url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products/{pid}/deliverables/{vid}"
+async def get_stock(pid):
+    url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products/{pid}/deliverables"
     status, raw, js = await request("GET", url)
     return js if isinstance(js, list) else js.get("deliverables") if js else []
 
-async def update_stock(pid, vid, items):
-    url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products/{pid}/stock/{vid}"
+async def update_stock(pid, items):
+    url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products/{pid}/stock"
     return await request("PUT", url, {"deliverables": items})
 
 async def get_invoice(invoice_id):
@@ -73,7 +62,6 @@ def is_owner():
     async def predicate(interaction: discord.Interaction):
         if not isinstance(interaction.user, discord.Member):
             return False
-        # Comprobamos si tiene el rol de owner
         role_ids = [role.id for role in interaction.user.roles]
         if OWNER_ROLE_ID not in role_ids:
             await interaction.response.send_message("❌ You are not authorized to use this command.", ephemeral=True)
@@ -81,25 +69,13 @@ def is_owner():
         return True
     return app_commands.check(predicate)
 
-# --- AUTOCOMPLETE ---
+# --- AUTOCOMPLETE PRODUCTOS ---
 async def product_autocomplete(interaction: discord.Interaction, current: str):
     products = await list_products()
     return [
         app_commands.Choice(name=p.get("name"), value=str(p.get("id")))
         for p in products
         if current.lower() in (p.get("name") or "").lower()
-    ][:25]
-
-async def variant_autocomplete(interaction: discord.Interaction, current: str):
-    try:
-        product_id = str(interaction.namespace.product_id)
-    except AttributeError:
-        return []
-    variants = await get_variants(product_id)
-    return [
-        app_commands.Choice(name=v.get("name") or str(v.get("id")), value=str(v.get("id")))
-        for v in variants
-        if current.lower() in (v.get("name") or "").lower()
     ][:25]
 
 # --- COMANDOS ---
@@ -117,59 +93,58 @@ async def products_text(interaction: discord.Interaction):
     await interaction.response.send_message(message, ephemeral=True)
 
 @bot.tree.command(name="stock")
-@app_commands.describe(product_id="Producto a consultar", variant_id="Variante del producto")
+@app_commands.describe(product_id="Producto a consultar")
 @is_owner()
-@app_commands.autocomplete(product_id=product_autocomplete, variant_id=variant_autocomplete)
-async def stock(interaction: discord.Interaction, product_id: str, variant_id: str):
-    stock_list = await get_stock(product_id, variant_id)
+@app_commands.autocomplete(product_id=product_autocomplete)
+async def stock(interaction: discord.Interaction, product_id: str):
+    stock_list = await get_stock(product_id)
     if not stock_list:
-        return await interaction.response.send_message("❌ No stock for this product/variant.", ephemeral=True)
+        return await interaction.response.send_message("❌ No stock for this product.", ephemeral=True)
     preview = "\n".join(stock_list[:10])
     await interaction.response.send_message(
-        f"Stock for {product_id}/{variant_id}: {len(stock_list)} items\nPreview:\n```{preview}```",
+        f"Stock for {product_id}: {len(stock_list)} items\nPreview:\n```{preview}```",
         ephemeral=True
     )
 
 @bot.tree.command(name="addstock")
-@app_commands.describe(product_id="Producto al que añadir stock", variant_id="Variante del producto", items="Items a añadir, separados por coma")
+@app_commands.describe(product_id="Producto al que añadir stock", items="Items a añadir, separados por coma")
 @is_owner()
-@app_commands.autocomplete(product_id=product_autocomplete, variant_id=variant_autocomplete)
-async def addstock(interaction: discord.Interaction, product_id: str, variant_id: str, items: str):
+@app_commands.autocomplete(product_id=product_autocomplete)
+async def addstock(interaction: discord.Interaction, product_id: str, items: str):
     item_list = [x.strip() for x in items.split(",") if x.strip()]
     if not item_list:
         return await interaction.response.send_message("No items provided.", ephemeral=True)
-    status, raw, js = await update_stock(product_id, variant_id, item_list)
+    status, raw, js = await update_stock(product_id, item_list)
     if status < 200 or status >= 300:
         return await interaction.response.send_message(f"Error updating stock: {js or raw}", ephemeral=True)
-    await interaction.response.send_message(f"✅ Added {len(item_list)} items to {product_id}/{variant_id}", ephemeral=True)
+    await interaction.response.send_message(f"✅ Added {len(item_list)} items to {product_id}", ephemeral=True)
 
 @bot.tree.command(name="replace")
 @app_commands.describe(
     user="Usuario que recibirá los items",
     product_id="Producto a reemplazar",
-    variant_id="Variante del producto",
     quantity="Cantidad de items a remover"
 )
 @is_owner()
-@app_commands.autocomplete(product_id=product_autocomplete, variant_id=variant_autocomplete)
-async def replace(interaction: discord.Interaction, user: discord.Member, product_id: str, variant_id: str, quantity: int):
-    stock_list = await get_stock(product_id, variant_id)
+@app_commands.autocomplete(product_id=product_autocomplete)
+async def replace(interaction: discord.Interaction, user: discord.Member, product_id: str, quantity: int):
+    stock_list = await get_stock(product_id)
     if not stock_list:
-        return await interaction.response.send_message("❌ No stock for this product/variant.", ephemeral=True)
+        return await interaction.response.send_message("❌ No stock for this product.", ephemeral=True)
     if quantity > len(stock_list):
         return await interaction.response.send_message(f"❌ Not enough stock. Available: {len(stock_list)}", ephemeral=True)
     removed = stock_list[:quantity]
     remaining = stock_list[quantity:]
-    await update_stock(product_id, variant_id, remaining)
+    await update_stock(product_id, remaining)
     try:
         await user.send(f"📦 Here are your items:\n```{chr(10).join(removed)}```")
     except:
         await interaction.response.send_message("⚠️ Could not DM the user.", ephemeral=True)
     log_channel = bot.get_channel(LOGS_CHANNEL_ID)
     if log_channel:
-        await log_channel.send(f"{interaction.user} removed {quantity} items from {product_id}/{variant_id} and sent to {user}.")
+        await log_channel.send(f"{interaction.user} removed {quantity} items from {product_id} and sent to {user}.")
     await interaction.response.send_message(
-        f"✅ Removed {quantity} items from `{product_id}` variant `{variant_id}` and sent to {user.mention}",
+        f"✅ Removed {quantity} items from `{product_id}` and sent to {user.mention}",
         ephemeral=True
     )
 
