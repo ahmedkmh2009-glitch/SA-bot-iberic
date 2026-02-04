@@ -1,176 +1,245 @@
 import os
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
-import requests
 
-# --- VARIABLES ---
-TOKEN = os.environ["TOKEN"]
-SELLAUTH_API_KEY = os.environ["SELLAUTH_API_KEY"]
-SELLAUTH_SHOP_ID = os.environ["SELLAUTH_SHOP_ID"]
-LOG_CHANNEL_ID = 1456619335014547549  # Canal de logs
+# Variables de entorno
+TOKEN = os.getenv("TOKEN")
+SELLAUTH_API_KEY = os.getenv("SELLAUTH_API_KEY")
+SELLAUTH_SHOP_ID = os.getenv("SELLAUTH_SHOP_ID")
+LOGS_CHANNEL_ID = 1456619335014547549
 
+# Setup bot
 intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+intents.members = True
+bot = commands.Bot(command_prefix="/", intents=intents)
 
-HEADERS = {"Authorization": f"Bearer {SELLAUTH_API_KEY}", "Content-Type": "application/json"}
+# --- UTILIDADES DE API ---
+def headers():
+    return {"Authorization": f"Bearer {SELLAUTH_API_KEY}"}
 
-# --- FUNCIONES API ---
-def get_products():
+async def request(method, url, json_body=None):
+    async with aiohttp.ClientSession() as s:
+        async with s.request(method, url, headers=headers(), json=json_body) as r:
+            raw = await r.text()
+            try:
+                js = await r.json(content_type=None)
+            except Exception:
+                js = None
+            return r.status, raw, js
+
+# --- PRODUCTS ---
+async def list_products():
     url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products"
-    resp = requests.get(url, headers=HEADERS)
-    return resp.json().get("data", [])
+    status, raw, js = await request("GET", url)
+    data = js.get("data") if isinstance(js, dict) else js
+    return data if isinstance(data, list) else []
 
-def update_stock(product_id, variant_id, new_stock):
-    url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products/{product_id}/stock/{variant_id}"
-    requests.put(url, headers=HEADERS, json={"stock": new_stock})
+async def get_product(pid):
+    url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products/{pid}"
+    status, raw, js = await request("GET", url)
+    return js.get("data") if isinstance(js, dict) else js
 
-def get_variant_stock(product):
-    return "\n".join([f"{v['name']} (Variant ID: {v['id']}): {v['stock']}" for v in product.get("variants", [])])
+async def get_variants(pid):
+    p = await get_product(pid)
+    if not p: return []
+    if isinstance(p.get("variants"), list) and p["variants"]:
+        return p["variants"]
+    for k in ("variant", "default_variant"):
+        v = p.get(k)
+        if isinstance(v, dict) and v.get("id"):
+            return [v]
+    return []
 
-# --- EVENTO ON_READY ---
+async def get_stock(pid, vid):
+    url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products/{pid}/deliverables/{vid}"
+    return await request("GET", url)
+
+async def update_stock(pid, vid, items):
+    url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products/{pid}/stock/{vid}"
+    return await request("PUT", url, {"deliverables": items})
+
+# --- INVOICE ---
+async def get_invoice(invoice_id):
+    url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/invoices/{invoice_id}"
+    status, raw, js = await request("GET", url)
+    return status, js
+
+# --- INTERFACES DISCORD ---
+def split_lines(text):
+    return [x.strip() for x in text.splitlines() if x.strip()]
+
+class RestockModal(discord.ui.Modal, title="Add Stock"):
+    stock = discord.ui.TextInput(label="Stock (one per line)", style=discord.TextStyle.paragraph)
+
+    def __init__(self, pid, vid, pname, vname):
+        super().__init__()
+        self.pid = pid
+        self.vid = vid
+        self.pname = pname
+        self.vname = vname
+
+    async def on_submit(self, interaction: discord.Interaction):
+        items = split_lines(self.stock.value)
+        if not items:
+            return await interaction.response.send_message("No stock provided", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        status, raw, js = await update_stock(self.pid, self.vid, items)
+        embed = discord.Embed(
+            title="Stock Added",
+            description=f"{self.pname} / {self.vname}\nAdded {len(items)} items",
+            color=discord.Color.green()
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+class VariantSelect(discord.ui.Select):
+    def __init__(self, action, pid, pname, variants):
+        options = [discord.SelectOption(label=v.get("name") or str(v.get("id")), value=str(v.get("id"))) for v in variants]
+        super().__init__(placeholder="Select variant", options=options)
+        self.action = action
+        self.pid = pid
+        self.pname = pname
+
+    async def callback(self, interaction: discord.Interaction):
+        vid = int(self.values[0])
+        vname = next(o.label for o in self.options if o.value == str(vid))
+        if self.action == "restock":
+            await interaction.response.send_modal(RestockModal(self.pid, vid, self.pname, vname))
+        elif self.action == "stock":
+            status, raw, js = await get_stock(self.pid, vid)
+            stock_list = js if isinstance(js, list) else js.get("deliverables") if js else []
+            embed = discord.Embed(title=f"{self.pname} / {vname} Stock", description=f"Available: {len(stock_list)}", color=discord.Color.blurple())
+            if stock_list:
+                preview = "\n".join(stock_list[:10])
+                embed.add_field(name="Preview", value=f"```{preview}```", inline=False)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+class VariantView(discord.ui.View):
+    def __init__(self, action, pid, pname, variants):
+        super().__init__(timeout=180)
+        self.add_item(VariantSelect(action, pid, pname, variants))
+
+class ProductSelect(discord.ui.Select):
+    def __init__(self, action, products):
+        options = [discord.SelectOption(label=p.get("name") or str(p.get("id")), value=str(p.get("id"))) for p in products]
+        super().__init__(placeholder="Select product", options=options)
+        self.action = action
+
+    async def callback(self, interaction: discord.Interaction):
+        pid = int(self.values[0])
+        pname = next(o.label for o in self.options if o.value == str(pid))
+        variants = await get_variants(pid)
+        await interaction.response.send_message(embed=discord.Embed(title=pname), view=VariantView(self.action, pid, pname, variants), ephemeral=True)
+
+class ProductView(discord.ui.View):
+    def __init__(self, action, products):
+        super().__init__(timeout=180)
+        self.add_item(ProductSelect(action, products))
+
+# --- COMANDOS ---
+@bot.tree.command(name="products")
+async def products(interaction: discord.Interaction):
+    prods = await list_products()
+    await interaction.response.send_message("Select a product:", view=ProductView("stock", prods), ephemeral=True)
+
+@bot.tree.command(name="addstock")
+async def addstock(interaction: discord.Interaction):
+    prods = await list_products()
+    await interaction.response.send_message("Select a product to add stock:", view=ProductView("restock", prods), ephemeral=True)
+
+@bot.tree.command(name="stock")
+async def stock(interaction: discord.Interaction):
+    prods = await list_products()
+    await interaction.response.send_message("Select a product to view stock:", view=ProductView("stock", prods), ephemeral=True)
+
+@bot.tree.command(name="invoice")
+@app_commands.describe(invoice_id="Invoice ID to check")
+async def invoice(interaction: discord.Interaction, invoice_id: str):
+    status, js = await get_invoice(invoice_id)
+    if status != 200:
+        return await interaction.response.send_message(f"Invoice {invoice_id} not found.", ephemeral=True)
+    embed = discord.Embed(title=f"Invoice {invoice_id}", description=f"Status: {js.get('status')}\nPrice: {js.get('price')} {js.get('currency')}", color=discord.Color.green())
+    items = js.get("items") or []
+    for it in items:
+        embed.add_field(name=it.get("product", {}).get("name") or "Item", value=f"Quantity: {it.get('quantity')} | Delivered: {len(it.get('delivered') or [])}", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+class ReplaceModal(discord.ui.Modal, title="Replace Product"):
+    quantity = discord.ui.TextInput(label="Quantity to remove", style=discord.TextStyle.short)
+    def __init__(self, pid, vid, pname, vname, user):
+        super().__init__()
+        self.pid = pid
+        self.vid = vid
+        self.pname = pname
+        self.vname = vname
+        self.user = user
+
+    async def on_submit(self, interaction: discord.Interaction):
+        qty = int(self.quantity.value)
+        status, raw, js = await get_stock(self.pid, self.vid)
+        stock_list = js if isinstance(js, list) else js.get("deliverables") if js else []
+        if qty > len(stock_list):
+            return await interaction.response.send_message("Not enough stock to remove.", ephemeral=True)
+        removed = stock_list[:qty]
+        remaining = stock_list[qty:]
+        await update_stock(self.pid, self.vid, remaining)
+        # send removed to user
+        member = self.user
+        try:
+            await member.send(f"Here are your replaced accounts:\n```{chr(10).join(removed)}```")
+        except:
+            pass
+        # log in channel
+        log_channel = bot.get_channel(LOGS_CHANNEL_ID)
+        if log_channel:
+            await log_channel.send(f"{interaction.user} removed {qty} from {self.pname}/{self.vname} for {member}")
+        await interaction.response.send_message(f"Removed {qty} items and sent to {member.mention}", ephemeral=True)
+
+class ReplaceSelect(discord.ui.Select):
+    def __init__(self, pid, pname, variants, user):
+        options = [discord.SelectOption(label=v.get("name") or str(v.get("id")), value=str(v.get("id"))) for v in variants]
+        super().__init__(placeholder="Select variant", options=options)
+        self.pid = pid
+        self.pname = pname
+        self.user = user
+
+    async def callback(self, interaction: discord.Interaction):
+        vid = int(self.values[0])
+        vname = next(o.label for o in self.options if o.value == str(vid))
+        await interaction.response.send_modal(ReplaceModal(self.pid, vid, self.pname, vname, self.user))
+
+class ReplaceView(discord.ui.View):
+    def __init__(self, pid, pname, variants, user):
+        super().__init__()
+        self.add_item(ReplaceSelect(pid, pname, variants, user))
+
+@bot.tree.command(name="replace")
+@app_commands.describe(user="User to send removed accounts")
+async def replace(interaction: discord.Interaction, user: discord.Member):
+    prods = await list_products()
+    await interaction.response.send_message("Select product to replace:", view=ProductView("replace", prods), ephemeral=True)
+
+# --- FLASK PARA 24/7 ---
+from flask import Flask
+import threading
+
+app = Flask("")
+
+@app.route("/")
+def home():
+    return "Bot is running", 200
+
+def run_flask():
+    app.run(host="0.0.0.0", port=10000)
+
+# --- EJECUTAR FLASK EN HILO ---
+threading.Thread(target=run_flask).start()
+
+# --- START BOT ---
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    print(f"Bot listo - Conectado como {bot.user}")
+    print(f"Logged in as {bot.user}")
 
-# --- /products ---
-@bot.tree.command(name="products", description="Lista productos y variantes (IDs y stock)")
-async def products(interaction: discord.Interaction):
-    products_list = get_products()
-    if not products_list:
-        await interaction.response.send_message("No hay productos.")
-        return
-    embed = discord.Embed(title="Productos y Variantes", color=discord.Color.blue())
-    for p in products_list:
-        variants = "\n".join([f"{v['name']} (ID {v['id']}): {v['stock']} en stock" for v in p.get("variants", [])])
-        embed.add_field(name=f"{p['name']} (ID {p['id']})", value=variants or "No hay variantes", inline=False)
-    await interaction.response.send_message(embed=embed)
-
-# --- /stock ---
-@bot.tree.command(name="stock", description="Ver stock de un producto/variante")
-@app_commands.describe(product_id="ID del producto", variant_id="ID de la variante opcional")
-async def stock(interaction: discord.Interaction, product_id: int, variant_id: int = None):
-    products_list = get_products()
-    for p in products_list:
-        if p["id"] == product_id:
-            if variant_id:
-                for v in p.get("variants", []):
-                    if v["id"] == variant_id:
-                        await interaction.response.send_message(f"Stock {v['name']}: {v['stock']}")
-                        return
-            else:
-                embed = discord.Embed(title=f"Stock de {p['name']}", color=discord.Color.green())
-                for v in p.get("variants", []):
-                    embed.add_field(name=v['name'], value=f"Stock: {v['stock']} (Variant ID {v['id']})", inline=False)
-                await interaction.response.send_message(embed=embed)
-                return
-    await interaction.response.send_message("Producto o variante no encontrado.")
-
-# --- SELECT MENUS ---
-class ProductSelect(discord.ui.Select):
-    def __init__(self, products, callback):
-        options = []
-        for p in products:
-            for v in p.get("variants", []):
-                label = f"{p['name']} - {v['name']} ({v['stock']} en stock)"
-                value = f"{p['id']}|{v['id']}"
-                options.append(discord.SelectOption(label=label, value=value))
-        super().__init__(placeholder="Selecciona producto/variante...", min_values=1, max_values=1, options=options)
-        self.callback_func = callback
-
-    async def callback(self, interaction: discord.Interaction):
-        product_id, variant_id = map(int, self.values[0].split("|"))
-        await self.callback_func(interaction, product_id, variant_id)
-
-class ProductView(discord.ui.View):
-    def __init__(self, products, callback):
-        super().__init__()
-        self.add_item(ProductSelect(products, callback))
-
-# --- /addstock ---
-@bot.tree.command(name="addstock", description="Añade stock desde un TXT")
-@app_commands.describe(file="TXT con cuentas (mail:pass) por línea")
-async def addstock(interaction: discord.Interaction, file: discord.Attachment):
-    products_list = get_products()
-    async def handle_select(inter, product_id, variant_id):
-        content = await file.read()
-        lines = content.decode().splitlines()
-        for p in products_list:
-            if p["id"] == product_id:
-                for v in p.get("variants", []):
-                    if v["id"] == variant_id:
-                        stock_anterior = v["stock"] or 0
-                        stock_nuevo = stock_anterior + len(lines)
-                        update_stock(product_id, variant_id, stock_nuevo)
-                        embed = discord.Embed(
-                            title="Stock actualizado",
-                            description=f"Producto: {p['name']} - Variante: {v['name']}",
-                            color=discord.Color.green()
-                        )
-                        embed.add_field(name="Stock anterior", value=str(stock_anterior))
-                        embed.add_field(name="Stock añadido", value=str(len(lines)))
-                        embed.add_field(name="Stock nuevo", value=str(stock_nuevo))
-                        await inter.response.send_message(embed=embed)
-                        log_channel = bot.get_channel(LOG_CHANNEL_ID)
-                        if log_channel:
-                            await log_channel.send(f"ADDSTOCK: {len(lines)} cuentas añadidas a {v['name']} (Producto ID {product_id}, Stock anterior {stock_anterior}, Stock nuevo {stock_nuevo})")
-                        return
-    await interaction.response.send_message("Selecciona el producto/variante a añadir stock:", view=ProductView(products_list, handle_select))
-
-# --- /replace ---
-@bot.tree.command(name="replace", description="Hacer replace de un producto y enviar cuentas al DM del comprador")
-@app_commands.describe(amount="Cantidad a enviar", user="Usuario comprador")
-async def replace(interaction: discord.Interaction, amount: int, user: discord.User):
-    products_list = get_products()
-    async def handle_select(inter, product_id, variant_id):
-        for p in products_list:
-            if p["id"] == product_id:
-                for v in p.get("variants", []):
-                    if v["id"] == variant_id:
-                        stock_anterior = v["stock"] or 0
-                        if amount > stock_anterior:
-                            await inter.response.send_message("No hay suficiente stock para enviar.")
-                            return
-                        stock_nuevo = stock_anterior - amount
-                        update_stock(product_id, variant_id, stock_nuevo)
-                        cuentas = [f"account{i+1}@example.com:pass{i+1}" for i in range(amount)]
-                        cuentas_txt = "\n".join(cuentas)
-                        try:
-                            await user.send(f"Tus cuentas:\n```\n{cuentas_txt}\n```")
-                            embed = discord.Embed(
-                                title="Replace realizado",
-                                description=f"{amount} cuentas enviadas a {user.mention}",
-                                color=discord.Color.orange()
-                            )
-                            embed.add_field(name="Producto", value=p['name'])
-                            embed.add_field(name="Variante", value=v['name'])
-                            embed.add_field(name="Stock anterior", value=str(stock_anterior))
-                            embed.add_field(name="Stock nuevo", value=str(stock_nuevo))
-                            await inter.response.send_message(embed=embed)
-                        except:
-                            await inter.response.send_message("No se pudo enviar DM al usuario.")
-                        log_channel = bot.get_channel(LOG_CHANNEL_ID)
-                        if log_channel:
-                            await log_channel.send(f"REPLACE: {amount} cuentas de {v['name']} enviadas a {user} (Stock anterior: {stock_anterior}, Nuevo stock: {stock_nuevo})")
-                        return
-    await interaction.response.send_message("Selecciona el producto/variante a reemplazar:", view=ProductView(products_list, handle_select))
-
-# --- /invoice ---
-@bot.tree.command(name="invoice", description="Mostrar invoice de un pedido")
-@app_commands.describe(invoice_id="ID del invoice")
-async def invoice(interaction: discord.Interaction, invoice_id: str):
-    url = f"https://api.sellauth.com/v1/invoices/{invoice_id}"
-    resp = requests.get(url, headers=HEADERS)
-    if resp.status_code != 200:
-        await interaction.response.send_message("Invoice no encontrado.")
-        return
-    inv = resp.json()
-    embed = discord.Embed(title=f"Invoice {invoice_id}", description=f"Total: {inv.get('total')}", color=discord.Color.green())
-    for item in inv.get("items", []):
-        embed.add_field(name=item["name"], value=f"Cantidad: {item['quantity']} - Precio: {item['price']}", inline=False)
-    await interaction.response.send_message(embed=embed)
-
-# --- RUN BOT ---
 bot.run(TOKEN)
