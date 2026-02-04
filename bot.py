@@ -1,204 +1,156 @@
-import os
-import aiohttp
 import discord
-from discord import app_commands
 from discord.ext import commands
-from flask import Flask
+from discord import app_commands
+import aiohttp
+from flask import Flask, request, jsonify
 import threading
 
 # --- CONFIG ---
-TOKEN = os.getenv("TOKEN")
-SELLAUTH_API_KEY = os.getenv("SELLAUTH_API_KEY")
-SELLAUTH_SHOP_ID = os.getenv("SELLAUTH_SHOP_ID")
-LOGS_CHANNEL_ID = 1456619335014547549  # Canal de logs
-OWNER_ROLE_ID = 1456619228915568671  # Rol de owner
+TOKEN = "TU_DISCORD_BOT_TOKEN"
+OWNER_ID = 1456619228915568671  # Solo este usuario puede usar los comandos
+SELLAUTH_API_KEY = "TU_API_KEY"
+SELLAUTH_SHOP_ID = "TU_SHOP_ID"
 
-# --- BOT ---
+# --- DISCORD BOT ---
 intents = discord.Intents.default()
-intents.members = True
-bot = commands.Bot(command_prefix="/", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- UTILIDADES API ---
-def headers():
-    return {"Authorization": f"Bearer {SELLAUTH_API_KEY}"}
+# --- FLASK ---
+app = Flask(__name__)
 
-async def request(method, url, json_body=None):
-    async with aiohttp.ClientSession() as s:
-        async with s.request(method, url, headers=headers(), json=json_body) as r:
-            raw = await r.text()
-            try:
-                js = await r.json(content_type=None)
-            except:
-                js = None
-            return r.status, raw, js
-
-async def list_products():
+# --- UTILS ---
+async def fetch_products():
     url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products"
-    status, raw, js = await request("GET", url)
-    data = js.get("data") if isinstance(js, dict) else js
-    return data if isinstance(data, list) else []
+    headers = {"Authorization": f"Bearer {SELLAUTH_API_KEY}", "Content-Type": "application/json"}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as r:
+            data = await r.json()
+            return data.get("data", [])
 
-async def get_product(pid):
-    url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products/{pid}"
-    status, raw, js = await request("GET", url)
-    return js.get("data") if isinstance(js, dict) else js
-
-async def get_stock(pid):
-    url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products/{pid}/deliverables"
-    status, raw, js = await request("GET", url)
-    if isinstance(js, list):
-        return js
-    if isinstance(js, dict):
-        if "deliverables" in js and isinstance(js["deliverables"], list):
-            return js["deliverables"]
-        if "data" in js and isinstance(js["data"], list):
-            return js["data"]
-    return []
-
-# --- NUEVO: ADD STOCK con POST ---
 async def add_stock(pid, items):
     url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products/{pid}/deliverables"
-    return await request("POST", url, {"deliverables": items})
+    headers = {"Authorization": f"Bearer {SELLAUTH_API_KEY}", "Content-Type": "application/json"}
+    body = {"deliverables": items}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=body) as r:
+            try: js = await r.json()
+            except: js = await r.text()
+            return r.status, js
 
-# --- UPDATE STOCK REEMPLAZO COMPLETO ---
-async def update_stock(pid, items):
-    url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products/{pid}/stock"
-    return await request("PUT", url, {"deliverables": items})
+async def replace_stock(pid, items):
+    url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products/{pid}/deliverables/overwrite/0"
+    headers = {"Authorization": f"Bearer {SELLAUTH_API_KEY}", "Content-Type": "application/json"}
+    body = {"deliverables": items}
+    async with aiohttp.ClientSession() as session:
+        async with session.put(url, headers=headers, json=body) as r:
+            try: js = await r.json()
+            except: js = await r.text()
+            return r.status, js
 
-async def get_invoice(invoice_id):
-    url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/invoices/{invoice_id}"
-    status, raw, js = await request("GET", url)
-    return status, js
+def is_owner(interaction: discord.Interaction):
+    return interaction.user.id == OWNER_ID
 
-# --- PERMISOS POR ROL ---
-def is_owner():
-    async def predicate(interaction: discord.Interaction):
-        if not isinstance(interaction.user, discord.Member):
-            return False
-        role_ids = [role.id for role in interaction.user.roles]
-        if OWNER_ROLE_ID not in role_ids:
-            await interaction.response.send_message("❌ You are not authorized to use this command.", ephemeral=True)
-            return False
-        return True
-    return app_commands.check(predicate)
+# --- DISCORD MODALS ---
+class RestockModal(discord.ui.Modal, title="Add Stock"):
+    stock = discord.ui.TextInput(label="Stock (one per line)", style=discord.TextStyle.paragraph)
+    def __init__(self, pid, pname):
+        super().__init__()
+        self.pid = pid
+        self.pname = pname
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_owner(interaction):
+            return await interaction.response.send_message("❌ You are not authorized.", ephemeral=True)
+        items = [x.strip() for x in self.stock.value.splitlines() if x.strip()]
+        if not items: return await interaction.response.send_message("No stock provided", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        status, js = await add_stock(self.pid, items)
+        if status < 200 or status >= 300:
+            return await interaction.followup.send(f"Error updating stock: {js}", ephemeral=True)
+        await interaction.followup.send(f"✅ Added {len(items)} items to {self.pname}", ephemeral=True)
 
-# --- AUTOCOMPLETE PRODUCTOS ---
+class ReplaceModal(discord.ui.Modal, title="Replace Stock"):
+    stock = discord.ui.TextInput(label="New stock (one per line)", style=discord.TextStyle.paragraph)
+    def __init__(self, pid, pname):
+        super().__init__()
+        self.pid = pid
+        self.pname = pname
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_owner(interaction):
+            return await interaction.response.send_message("❌ You are not authorized.", ephemeral=True)
+        items = [x.strip() for x in self.stock.value.splitlines() if x.strip()]
+        if not items: return await interaction.response.send_message("No stock provided", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        status, js = await replace_stock(self.pid, items)
+        if status < 200 or status >= 300:
+            return await interaction.followup.send(f"Error replacing stock: {js}", ephemeral=True)
+        await interaction.followup.send(f"🟠 Replaced stock of {self.pname} with {len(items)} items", ephemeral=True)
+
+# --- DISCORD AUTOCOMPLETE ---
 async def product_autocomplete(interaction: discord.Interaction, current: str):
-    products = await list_products()
-    return [
-        app_commands.Choice(name=p.get("name"), value=str(p.get("id")))
-        for p in products
-        if current.lower() in (p.get("name") or "").lower()
-    ][:25]
+    products = await fetch_products()
+    choices = [app_commands.Choice(name=p["name"], value=str(p["id"])) for p in products if current.lower() in p["name"].lower()]
+    return choices[:25]
 
-# --- COMANDOS ---
-@bot.tree.command(name="products_text")
-@is_owner()
-async def products_text(interaction: discord.Interaction):
-    products = await list_products()
-    if not products:
-        return await interaction.response.send_message("No products found.", ephemeral=True)
-    message = "**Available products:**\n"
-    for p in products:
-        pid = p.get("id")
-        pname = p.get("name")
-        message += f"- `{pid}`: {pname}\n"
-    await interaction.response.send_message(message, ephemeral=True)
+# --- DISCORD SLASH COMMANDS ---
+@bot.tree.command(name="restock", description="Add stock to a product")
+@app_commands.describe(product="Choose the product")
+@app_commands.autocomplete(product=product_autocomplete)
+async def restock(interaction: discord.Interaction, product: str):
+    if not is_owner(interaction): return await interaction.response.send_message("❌ Not authorized.", ephemeral=True)
+    products = await fetch_products()
+    prod = next((p for p in products if str(p["id"]) == product), None)
+    if not prod: return await interaction.response.send_message("❌ Product not found", ephemeral=True)
+    modal = RestockModal(pid=prod["id"], pname=prod["name"])
+    await interaction.response.send_modal(modal)
 
-@bot.tree.command(name="stock")
-@app_commands.describe(product_id="Producto a consultar")
-@is_owner()
-@app_commands.autocomplete(product_id=product_autocomplete)
-async def stock(interaction: discord.Interaction, product_id: str):
-    stock_list = await get_stock(product_id)
-    if not stock_list:
-        return await interaction.response.send_message("❌ No stock for this product.", ephemeral=True)
-    preview = "\n".join(stock_list[:10])
-    await interaction.response.send_message(
-        f"Stock for {product_id}: {len(stock_list)} items\nPreview:\n```{preview}```",
-        ephemeral=True
-    )
+@bot.tree.command(name="replace", description="Replace stock of a product")
+@app_commands.describe(product="Choose the product")
+@app_commands.autocomplete(product=product_autocomplete)
+async def replace(interaction: discord.Interaction, product: str):
+    if not is_owner(interaction): return await interaction.response.send_message("❌ Not authorized.", ephemeral=True)
+    products = await fetch_products()
+    prod = next((p for p in products if str(p["id"]) == product), None)
+    if not prod: return await interaction.response.send_message("❌ Product not found", ephemeral=True)
+    modal = ReplaceModal(pid=prod["id"], pname=prod["name"])
+    await interaction.response.send_modal(modal)
 
-@bot.tree.command(name="addstock")
-@app_commands.describe(product_id="Producto al que añadir stock", items="Items a añadir, separados por coma")
-@is_owner()
-@app_commands.autocomplete(product_id=product_autocomplete)
-async def addstock(interaction: discord.Interaction, product_id: str, items: str):
-    item_list = [x.strip() for x in items.split(",") if x.strip()]
-    if not item_list:
-        return await interaction.response.send_message("No items provided.", ephemeral=True)
-    status, raw, js = await add_stock(product_id, item_list)  # <-- usa POST
-    if status < 200 or status >= 300:
-        return await interaction.response.send_message(f"Error updating stock: {js or raw}", ephemeral=True)
-    await interaction.response.send_message(f"✅ Added {len(item_list)} items to {product_id}", ephemeral=True)
-
-@bot.tree.command(name="replace")
-@app_commands.describe(
-    user="Usuario que recibirá los items",
-    product_id="Producto a reemplazar",
-    quantity="Cantidad de items a remover"
-)
-@is_owner()
-@app_commands.autocomplete(product_id=product_autocomplete)
-async def replace(interaction: discord.Interaction, user: discord.Member, product_id: str, quantity: int):
-    stock_list = await get_stock(product_id)
-    if not stock_list:
-        return await interaction.response.send_message("❌ No stock for this product.", ephemeral=True)
-    if quantity > len(stock_list):
-        return await interaction.response.send_message(f"❌ Not enough stock. Available: {len(stock_list)}", ephemeral=True)
-    removed = stock_list[:quantity]
-    remaining = stock_list[quantity:]
-    await update_stock(product_id, remaining)
-    try:
-        await user.send(f"📦 Here are your items:\n```{chr(10).join(removed)}```")
-    except:
-        await interaction.response.send_message("⚠️ Could not DM the user.", ephemeral=True)
-    log_channel = bot.get_channel(LOGS_CHANNEL_ID)
-    if log_channel:
-        await log_channel.send(f"{interaction.user} removed {quantity} items from {product_id} and sent to {user}.")
-    await interaction.response.send_message(
-        f"✅ Removed {quantity} items from `{product_id}` and sent to {user.mention}",
-        ephemeral=True
-    )
-
-@bot.tree.command(name="invoice")
-@app_commands.describe(invoice_id="Invoice ID to check")
-@is_owner()
-async def invoice(interaction: discord.Interaction, invoice_id: str):
-    status, js = await get_invoice(invoice_id)
-    if status != 200:
-        return await interaction.response.send_message(f"Invoice {invoice_id} not found.", ephemeral=True)
-    embed = discord.Embed(
-        title=f"Invoice {invoice_id}",
-        description=f"Status: {js.get('status')}\nPrice: {js.get('price')} {js.get('currency')}",
-        color=discord.Color.green()
-    )
-    items = js.get("items") or []
-    for it in items:
-        deliverables = it.get("delivered") or []
-        embed.add_field(
-            name=it.get("product", {}).get("name") or "Item",
-            value=f"Quantity: {it.get('quantity')} | Delivered: {len(deliverables)}\nDeliverables:\n```{chr(10).join(deliverables) if deliverables else 'None'}```",
-            inline=False
-        )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-# --- FLASK PARA 24/7 ---
-app = Flask("")
-
-@app.route("/")
-def home():
-    return "Bot is running", 200
-
-def run_flask():
-    app.run(host="0.0.0.0", port=10000)
-
-threading.Thread(target=run_flask).start()
-
-# --- START BOT ---
 @bot.event
 async def on_ready():
-    await bot.tree.sync()
     print(f"Logged in as {bot.user}")
+    try:
+        await bot.tree.sync()
+        print("Commands synced")
+    except Exception as e:
+        print(e)
 
+# --- FLASK ENDPOINTS ---
+@app.route("/restock", methods=["POST"])
+def flask_restock():
+    data = request.json
+    pid = data.get("product_id")
+    items = data.get("items", [])
+    if not pid or not items:
+        return jsonify({"error": "Missing product_id or items"}), 400
+
+    import asyncio
+    status, resp = asyncio.run(add_stock(pid, items))
+    return jsonify({"status": status, "response": resp})
+
+@app.route("/replace", methods=["POST"])
+def flask_replace():
+    data = request.json
+    pid = data.get("product_id")
+    items = data.get("items", [])
+    if not pid or not items:
+        return jsonify({"error": "Missing product_id or items"}), 400
+
+    import asyncio
+    status, resp = asyncio.run(replace_stock(pid, items))
+    return jsonify({"status": status, "response": resp})
+
+# --- RUN BOTH FLASK + DISCORD ---
+def run_flask():
+    app.run(host="0.0.0.0", port=5000)
+
+threading.Thread(target=run_flask).start()
 bot.run(TOKEN)
