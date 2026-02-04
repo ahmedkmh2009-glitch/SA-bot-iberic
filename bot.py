@@ -1,201 +1,203 @@
 import os
-import aiohttp
 import discord
-from discord.ext import commands
 from discord import app_commands
-from flask import Flask
-from threading import Thread
+from discord.ext import commands
+import requests
+import io
 
-# ---------------- ENV ----------------
+# Variables de entorno
+SELLAUTH_API_KEY = os.getenv("SELLAUTH_API_KEY")
+SELLAUTH_SHOP_ID = os.getenv("SELLAUTH_SHOP_ID")
 TOKEN = os.getenv("TOKEN")
-API_KEY = os.getenv("SELLAUTH_API_KEY")
-SHOP_ID = os.getenv("SELLAUTH_SHOP_ID")
+LOGS_CHANNEL_ID = int(os.getenv("LOGS_CHANNEL_ID"))
 
-# ---------------- FLASK KEEP ALIVE ----------------
-app = Flask("")
-
-@app.route("/")
-def home():
-    return "Bot Online"
-
-def run_web():
-    app.run(host="0.0.0.0", port=8080)
-
-def keep_alive():
-    t = Thread(target=run_web)
-    t.start()
-
-# ---------------- DISCORD SETUP ----------------
+# Bot
 intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
+intents.message_content = True
+bot = commands.Bot(command_prefix="/", intents=intents)
 
-# ---------------- SELLAUTH API ----------------
-def headers():
-    return {"Authorization": f"Bearer {API_KEY}"}
+# Encabezados de la API
+headers = {
+    "Authorization": f"Bearer {SELLAUTH_API_KEY}",
+    "Content-Type": "application/json"
+}
 
-async def api_request(method, url, body=None):
-    async with aiohttp.ClientSession() as s:
-        async with s.request(method, url, headers=headers(), json=body) as r:
-            try:
-                js = await r.json(content_type=None)
-            except:
-                js = None
-            return r.status, js
+# =====================
+# FUNCIONES API
+# =====================
 
-# ---------- INVOICE ----------
-async def get_invoice(invoice_id):
-    url = f"https://api.sellauth.com/v1/shops/{SHOP_ID}/orders/{invoice_id}"
-    status, js = await api_request("GET", url)
-    if status != 200 or not js:
-        return None
-    return js.get("data")
+def get_products():
+    """Devuelve la lista de productos con sus variantes y stock"""
+    url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products"
+    r = requests.get(url, headers=headers)
+    if r.status_code != 200:
+        return []
+    data = r.json().get("data", [])
+    products_list = []
+    for p in data:
+        for v in p.get("variants", []):
+            products_list.append({
+                "product_id": p["id"],
+                "variant_id": v["id"],
+                "name": p["name"],
+                "variant": v["name"],
+                "stock": v.get("stock", 0)
+            })
+    return products_list
 
-# ---------- ORDER ----------
-async def get_order(order_id):
-    url = f"https://api.sellauth.com/v1/shops/{SHOP_ID}/orders/{order_id}"
-    status, js = await api_request("GET", url)
-    return js.get("data") if js else None
+def update_stock(product_id, variant_id, new_stock):
+    """Actualiza el stock de una variante"""
+    url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products/{product_id}/stock/{variant_id}"
+    r = requests.put(url, headers=headers, json={"stock": new_stock})
+    return r.status_code == 200
 
-# ---------- PRODUCTS ----------
-async def list_products():
-    url = f"https://api.sellauth.com/v1/shops/{SHOP_ID}/products"
-    _, js = await api_request("GET", url)
-    return js.get("data", []) if isinstance(js, dict) else []
+def get_stock(product_id, variant_id):
+    """Obtiene stock de una variante"""
+    products = get_products()
+    for p in products:
+        if p["product_id"] == product_id and p["variant_id"] == variant_id:
+            return p["stock"]
+    return None
 
-async def get_variants(pid):
-    url = f"https://api.sellauth.com/v1/shops/{SHOP_ID}/products/{pid}"
-    _, js = await api_request("GET", url)
-    return js.get("data", {}).get("variants", [])
+# =====================
+# COMANDOS SLASH
+# =====================
 
-async def append_stock(pid, vid, items):
-    url = f"https://api.sellauth.com/v1/shops/{SHOP_ID}/products/{pid}/deliverables/append/{vid}"
-    return await api_request("PUT", url, {"deliverables": items})
-
-async def get_stock(pid, vid):
-    url = f"https://api.sellauth.com/v1/shops/{SHOP_ID}/products/{pid}/deliverables/{vid}"
-    return await api_request("GET", url)
-
-# Quick stock total
-async def quick_stock(pid):
-    variants = await get_variants(pid)
-    total = 0
-    for v in variants:
-        _, js = await get_stock(pid, v["id"])
-        if js and isinstance(js, list):
-            total += len(js)
-    return total
-
-# ---------------- UI COMPONENTS ----------------
-class RestockModal(discord.ui.Modal, title="Restock"):
-    stock = discord.ui.TextInput(label="Stock (1 por línea)", style=discord.TextStyle.paragraph)
-
-    def __init__(self, pid, vid):
-        super().__init__()
-        self.pid = pid
-        self.vid = vid
-
-    async def on_submit(self, interaction: discord.Interaction):
-        items = [x for x in self.stock.value.splitlines() if x.strip()]
-        await append_stock(self.pid, self.vid, items)
-        await interaction.response.send_message(f"Added {len(items)} items", ephemeral=True)
-
-class VariantSelect(discord.ui.Select):
-    def __init__(self, pid, variants):
-        options = [
-            discord.SelectOption(label=v["name"], value=str(v["id"]))
-            for v in variants
-        ]
-        super().__init__(placeholder="Select Variant", options=options)
-        self.pid = pid
-
-    async def callback(self, interaction: discord.Interaction):
-        vid = self.values[0]
-        await interaction.response.send_modal(RestockModal(self.pid, vid))
-
-class ProductSelect(discord.ui.Select):
-    def __init__(self, products):
-        options = [
-            discord.SelectOption(label=p["name"], value=str(p["id"]))
-            for p in products
-        ]
-        super().__init__(placeholder="Select Product", options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        pid = self.values[0]
-        variants = await get_variants(pid)
-        view = discord.ui.View()
-        view.add_item(VariantSelect(pid, variants))
-        await interaction.response.send_message("Select Variant", view=view, ephemeral=True)
-
-class StockPanel(discord.ui.View):
-    @discord.ui.button(label="Restock", style=discord.ButtonStyle.green)
-    async def restock(self, interaction: discord.Interaction, button: discord.ui.Button):
-        products = await list_products()
-        view = discord.ui.View()
-        view.add_item(ProductSelect(products))
-        await interaction.response.send_message("Select Product", view=view, ephemeral=True)
-
-# ---------------- COMMANDS ----------------
-@bot.tree.command(name="invoice", description="Ver invoice por ID")
-async def invoice(interaction: discord.Interaction, invoice_id: str):
-    if not interaction.user.guild_permissions.administrator:
-        return await interaction.response.send_message("No permiso", ephemeral=True)
-
-    await interaction.response.defer(ephemeral=True)
-    data = await get_invoice(invoice_id)
-    if not data:
-        return await interaction.followup.send("Invoice no encontrada")
-
-    embed = discord.Embed(title=f"Invoice {invoice_id}", color=discord.Color.green())
-    embed.add_field(name="Email", value=str(data.get("email", "N/A")))
-    embed.add_field(name="Precio", value=str(data.get("total_price", "N/A")))
-    embed.add_field(name="Estado", value=str(data.get("status", "N/A")))
-    embed.add_field(name="Producto", value=str(data.get("product_name", "N/A")))
-
-    deliverables = data.get("deliverables", [])
-    if deliverables:
-        preview = "\n".join(deliverables[:10])
-        embed.add_field(name="Keys / Deliverables", value=f"```{preview}```", inline=False)
-
-    await interaction.followup.send(embed=embed)
-
-@bot.tree.command(name="panel-stock", description="Panel de stock")
-async def panel_stock(interaction: discord.Interaction):
-    await interaction.response.send_message(embed=discord.Embed(title="Stock Panel"), view=StockPanel())
-
-@bot.tree.command(name="product-list", description="Lista productos")
-async def product_list(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    products = await list_products()
-    if not products:
-        return await interaction.followup.send("No hay productos")
-    text = "\n".join([f"{p['name']} - ID: {p['id']}" for p in products])
-    await interaction.followup.send(f"```{text}```")
-
-@bot.tree.command(name="stock", description="Ver stock rápido por product ID")
-async def stock(interaction: discord.Interaction, product_id: str):
-    await interaction.response.defer(ephemeral=True)
-    amount = await quick_stock(product_id)
-    await interaction.followup.send(f"Stock disponible: {amount}")
-
-@bot.tree.command(name="order", description="Ver pedido por ID")
-async def order(interaction: discord.Interaction, order_id: str):
-    await interaction.response.defer(ephemeral=True)
-    data = await get_order(order_id)
-    if not data:
-        return await interaction.followup.send("Pedido no encontrado")
-    embed = discord.Embed(title=f"Order {order_id}", color=discord.Color.blue())
-    embed.add_field(name="Email", value=str(data.get("email", "N/A")))
-    embed.add_field(name="Estado", value=str(data.get("status", "N/A")))
-    embed.add_field(name="Precio", value=str(data.get("total_price", "N/A")))
-    await interaction.followup.send(embed=embed)
-
-# ---------------- READY ----------------
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    print(f"Bot conectado como {bot.user}")
+    print(f"Bot listo como {bot.user}")
 
-# ---------------- RUN ----------------
-keep_alive()
+# --- LISTAR PRODUCTOS ---
+@bot.tree.command(name="products", description="Lista todos los productos con sus variantes y stock")
+async def products(interaction: discord.Interaction):
+    products = get_products()
+    if not products:
+        await interaction.response.send_message("No se pudieron obtener los productos.", ephemeral=True)
+        return
+    desc = ""
+    for p in products:
+        desc += f"**{p['name']}** | Variante: {p['variant']} | Product ID: {p['product_id']} | Variant ID: {p['variant_id']} | Stock: {p['stock']}\n"
+    embed = discord.Embed(title="Productos y variantes", description=desc, color=0x00ff00)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# --- VER STOCK ---
+@bot.tree.command(name="stock", description="Ver stock de un producto/variante")
+@app_commands.describe(product_id="ID del producto", variant_id="ID de la variante")
+async def stock(interaction: discord.Interaction, product_id: int, variant_id: int):
+    s = get_stock(product_id, variant_id)
+    if s is None:
+        await interaction.response.send_message("Producto o variante no encontrado.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Stock actual: {s}", ephemeral=True)
+
+# --- ADD STOCK ---
+@bot.tree.command(name="addstock", description="Añade stock a un producto desde un archivo txt")
+@app_commands.describe(product_id="ID del producto", variant_id="ID de la variante")
+async def addstock(interaction: discord.Interaction, product_id: int, variant_id: int):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("No tienes permisos.", ephemeral=True)
+        return
+
+    await interaction.response.send_message("Envía el archivo TXT con las cuentas.", ephemeral=True)
+
+    def check(m):
+        return m.author == interaction.user and m.attachments
+
+    msg = await bot.wait_for('message', check=check, timeout=60)
+    file = msg.attachments[0]
+    content = await file.read()
+    lines = content.decode().splitlines()
+
+    current_stock = get_stock(product_id, variant_id) or 0
+    new_stock = current_stock + len(lines)
+    success = update_stock(product_id, variant_id, new_stock)
+
+    if success:
+        # Log en canal
+        log_channel = bot.get_channel(LOGS_CHANNEL_ID)
+        if log_channel:
+            embed = discord.Embed(title="📦 Stock añadido", color=0x00ff00)
+            embed.add_field(name="Producto ID", value=product_id, inline=True)
+            embed.add_field(name="Variante ID", value=variant_id, inline=True)
+            embed.add_field(name="Stock anterior", value=current_stock, inline=True)
+            embed.add_field(name="Stock actual", value=new_stock, inline=True)
+            embed.add_field(name="Cantidad de cuentas añadidas", value=len(lines), inline=True)
+            await log_channel.send(embed=embed)
+
+        await interaction.followup.send(f"Stock actualizado correctamente. Total: {new_stock}", ephemeral=True)
+    else:
+        await interaction.followup.send("Error al actualizar stock.", ephemeral=True)
+
+# --- REPLACE ---
+@bot.tree.command(name="replace", description="Hacer replace de un producto y enviar cuentas al comprador")
+@app_commands.describe(product_id="ID del producto", variant_id="ID de la variante", user="Usuario comprador")
+async def replace(interaction: discord.Interaction, product_id: int, variant_id: int, user: discord.User):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("No tienes permisos.", ephemeral=True)
+        return
+
+    await interaction.response.send_message("Envía el archivo TXT con las cuentas a entregar.", ephemeral=True)
+
+    def check(m):
+        return m.author == interaction.user and m.attachments
+
+    msg = await bot.wait_for('message', check=check, timeout=60)
+    file = msg.attachments[0]
+    content = await file.read()
+    lines = content.decode().splitlines()
+
+    current_stock = get_stock(product_id, variant_id) or 0
+    if current_stock < len(lines):
+        await interaction.followup.send(f"No hay suficiente stock. Actual: {current_stock}", ephemeral=True)
+        return
+
+    new_stock = current_stock - len(lines)
+    success = update_stock(product_id, variant_id, new_stock)
+
+    if success:
+        # Enviar DM al comprador
+        dm = await user.create_dm()
+        msg_content = f"📦 Tu replace ha sido procesado\nProducto ID: {product_id}\nVariante ID: {variant_id}\nCantidad entregada: {len(lines)}\nCuentas:\n" + "\n".join(lines)
+        await dm.send(msg_content)
+
+        # Log en canal
+        log_channel = bot.get_channel(LOGS_CHANNEL_ID)
+        if log_channel:
+            embed = discord.Embed(title="🔄 Replace procesado", color=0xffa500)
+            embed.add_field(name="Producto ID", value=product_id, inline=True)
+            embed.add_field(name="Variante ID", value=variant_id, inline=True)
+            embed.add_field(name="Stock anterior", value=current_stock, inline=True)
+            embed.add_field(name="Stock actual", value=new_stock, inline=True)
+            embed.add_field(name="Cantidad entregada", value=len(lines), inline=True)
+            embed.add_field(name="Comprador", value=user.mention, inline=True)
+            embed.add_field(name="Acción realizada por", value=interaction.user.mention, inline=True)
+            embed.add_field(name="Cuentas enviadas", value="\n".join(lines), inline=False)
+            await log_channel.send(embed=embed)
+
+        await interaction.followup.send(f"Replace realizado con éxito. Se enviaron {len(lines)} cuentas a {user.mention}", ephemeral=True)
+    else:
+        await interaction.followup.send("Error al actualizar stock.", ephemeral=True)
+
+# --- INVOICE ---
+@bot.tree.command(name="invoice", description="Ver invoice de un pedido")
+@app_commands.describe(invoice_id="ID de la invoice")
+async def invoice(interaction: discord.Interaction, invoice_id: str):
+    url = f"https://api.sellauth.com/v1/invoices/{invoice_id}"
+    r = requests.get(url, headers=headers)
+    if r.status_code != 200:
+        await interaction.response.send_message("Invoice no encontrada.", ephemeral=True)
+        return
+
+    data = r.json()
+    embed = discord.Embed(title=f"Invoice #{invoice_id}", color=0x0000ff)
+    embed.add_field(name="Cliente", value=data.get("customer_name", "Desconocido"))
+    embed.add_field(name="Total", value=data.get("total", "0"))
+    embed.add_field(name="Estado", value=data.get("status", "Desconocido"))
+    embed.add_field(name="Productos", value="\n".join([f"{p['name']} x{p['quantity']}" for p in data.get("items", [])]) or "Ninguno", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# =====================
+# RUN BOT
+# =====================
 bot.run(TOKEN)
