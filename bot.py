@@ -11,10 +11,11 @@ TOKEN = os.getenv("TOKEN")
 SELLAUTH_API_KEY = os.getenv("SELLAUTH_API_KEY")
 SELLAUTH_SHOP_ID = os.getenv("SELLAUTH_SHOP_ID")
 LOGS_CHANNEL_ID = 1456619335014547549  # Canal de logs
-OWNER_ID = 1456619228915568671  # Solo este usuario puede usar comandos
+OWNER_ROLE_ID = 1456619228915568671  # Ahora es un rol de owner
 
 # --- BOT ---
 intents = discord.Intents.default()
+intents.members = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 
 # --- UTILIDADES API ---
@@ -67,80 +68,115 @@ async def get_invoice(invoice_id):
     status, raw, js = await request("GET", url)
     return status, js
 
-# --- PERMISOS ---
+# --- PERMISOS POR ROL ---
 def is_owner():
     async def predicate(interaction: discord.Interaction):
-        if interaction.user.id != OWNER_ID:
+        if not isinstance(interaction.user, discord.Member):
+            return False
+        # Comprobamos si tiene el rol de owner
+        role_ids = [role.id for role in interaction.user.roles]
+        if OWNER_ROLE_ID not in role_ids:
             await interaction.response.send_message("❌ You are not authorized to use this command.", ephemeral=True)
             return False
         return True
     return app_commands.check(predicate)
 
-# --- COMANDOS BOT ---
+# --- AUTOCOMPLETE ---
+async def product_autocomplete(interaction: discord.Interaction, current: str):
+    products = await list_products()
+    return [
+        app_commands.Choice(name=p.get("name"), value=str(p.get("id")))
+        for p in products
+        if current.lower() in (p.get("name") or "").lower()
+    ][:25]
+
+async def variant_autocomplete(interaction: discord.Interaction, current: str):
+    try:
+        product_id = str(interaction.namespace.product_id)
+    except AttributeError:
+        return []
+    variants = await get_variants(product_id)
+    return [
+        app_commands.Choice(name=v.get("name") or str(v.get("id")), value=str(v.get("id")))
+        for v in variants
+        if current.lower() in (v.get("name") or "").lower()
+    ][:25]
+
+# --- COMANDOS ---
 @bot.tree.command(name="products_text")
 @is_owner()
 async def products_text(interaction: discord.Interaction):
-    """Lista todos los productos disponibles"""
     products = await list_products()
     if not products:
         return await interaction.response.send_message("No products found.", ephemeral=True)
-
     message = "**Available products:**\n"
     for p in products:
         pid = p.get("id")
         pname = p.get("name")
         message += f"- `{pid}`: {pname}\n"
-    message += "\nType `/addtocart <product_id>` to add it to your command."
     await interaction.response.send_message(message, ephemeral=True)
 
-@bot.tree.command(name="addtocart")
-@app_commands.describe(product_id="ID of the product to add")
-@is_owner()
-async def addtocart(interaction: discord.Interaction, product_id: str):
-    """Añade un producto al comando SBS"""
-    product = await get_product(product_id)
-    if not product:
-        return await interaction.response.send_message("Product not found.", ephemeral=True)
-    
-    await interaction.response.send_message(f"✅ Added **{product.get('name')}** to your command.", ephemeral=True)
-
 @bot.tree.command(name="stock")
-@app_commands.describe(product_id="ID of the product to check stock")
+@app_commands.describe(product_id="Producto a consultar", variant_id="Variante del producto")
 @is_owner()
-async def stock(interaction: discord.Interaction, product_id: str):
-    """Muestra el stock de un producto"""
-    variants = await get_variants(product_id)
-    if not variants:
-        return await interaction.response.send_message("No variants found for this product.", ephemeral=True)
-    
-    msg = f"**Stock for {product_id}:**\n"
-    for v in variants:
-        vid = v.get("id")
-        vname = v.get("name") or str(vid)
-        stock_list = await get_stock(product_id, vid)
-        msg += f"- Variant `{vname}`: {len(stock_list)} items\n"
-        if stock_list:
-            msg += "  Preview: ```" + "\n".join(stock_list[:10]) + "```\n"
-    await interaction.response.send_message(msg, ephemeral=True)
+@app_commands.autocomplete(product_id=product_autocomplete, variant_id=variant_autocomplete)
+async def stock(interaction: discord.Interaction, product_id: str, variant_id: str):
+    stock_list = await get_stock(product_id, variant_id)
+    if not stock_list:
+        return await interaction.response.send_message("❌ No stock for this product/variant.", ephemeral=True)
+    preview = "\n".join(stock_list[:10])
+    await interaction.response.send_message(
+        f"Stock for {product_id}/{variant_id}: {len(stock_list)} items\nPreview:\n```{preview}```",
+        ephemeral=True
+    )
 
 @bot.tree.command(name="addstock")
-@app_commands.describe(product_id="ID of the product", variant_id="ID of the variant", items="Items to add, comma-separated")
+@app_commands.describe(product_id="Producto al que añadir stock", variant_id="Variante del producto", items="Items a añadir, separados por coma")
 @is_owner()
+@app_commands.autocomplete(product_id=product_autocomplete, variant_id=variant_autocomplete)
 async def addstock(interaction: discord.Interaction, product_id: str, variant_id: str, items: str):
-    """Añade stock a un producto"""
     item_list = [x.strip() for x in items.split(",") if x.strip()]
     if not item_list:
         return await interaction.response.send_message("No items provided.", ephemeral=True)
     status, raw, js = await update_stock(product_id, variant_id, item_list)
     if status < 200 or status >= 300:
         return await interaction.response.send_message(f"Error updating stock: {js or raw}", ephemeral=True)
-    await interaction.response.send_message(f"✅ Added {len(item_list)} items to product `{product_id}` variant `{variant_id}`.", ephemeral=True)
+    await interaction.response.send_message(f"✅ Added {len(item_list)} items to {product_id}/{variant_id}", ephemeral=True)
+
+@bot.tree.command(name="replace")
+@app_commands.describe(
+    user="Usuario que recibirá los items",
+    product_id="Producto a reemplazar",
+    variant_id="Variante del producto",
+    quantity="Cantidad de items a remover"
+)
+@is_owner()
+@app_commands.autocomplete(product_id=product_autocomplete, variant_id=variant_autocomplete)
+async def replace(interaction: discord.Interaction, user: discord.Member, product_id: str, variant_id: str, quantity: int):
+    stock_list = await get_stock(product_id, variant_id)
+    if not stock_list:
+        return await interaction.response.send_message("❌ No stock for this product/variant.", ephemeral=True)
+    if quantity > len(stock_list):
+        return await interaction.response.send_message(f"❌ Not enough stock. Available: {len(stock_list)}", ephemeral=True)
+    removed = stock_list[:quantity]
+    remaining = stock_list[quantity:]
+    await update_stock(product_id, variant_id, remaining)
+    try:
+        await user.send(f"📦 Here are your items:\n```{chr(10).join(removed)}```")
+    except:
+        await interaction.response.send_message("⚠️ Could not DM the user.", ephemeral=True)
+    log_channel = bot.get_channel(LOGS_CHANNEL_ID)
+    if log_channel:
+        await log_channel.send(f"{interaction.user} removed {quantity} items from {product_id}/{variant_id} and sent to {user}.")
+    await interaction.response.send_message(
+        f"✅ Removed {quantity} items from `{product_id}` variant `{variant_id}` and sent to {user.mention}",
+        ephemeral=True
+    )
 
 @bot.tree.command(name="invoice")
 @app_commands.describe(invoice_id="Invoice ID to check")
 @is_owner()
 async def invoice(interaction: discord.Interaction, invoice_id: str):
-    """Consulta una factura"""
     status, js = await get_invoice(invoice_id)
     if status != 200:
         return await interaction.response.send_message(f"Invoice {invoice_id} not found.", ephemeral=True)
@@ -158,37 +194,6 @@ async def invoice(interaction: discord.Interaction, invoice_id: str):
             inline=False
         )
     await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="replace")
-@app_commands.describe(user="Usuario al que enviar los items", product_id="ID del producto", variant_id="ID de la variante", quantity="Cantidad a remover")
-@is_owner()
-async def replace(interaction: discord.Interaction, user: discord.Member, product_id: str, variant_id: str, quantity: int):
-    """Quita items de stock y los envía a un usuario"""
-    stock_list = await get_stock(product_id, variant_id)
-    if not stock_list:
-        return await interaction.response.send_message("No stock available for this product/variant.", ephemeral=True)
-    
-    if quantity > len(stock_list):
-        return await interaction.response.send_message(f"❌ Not enough stock. Available: {len(stock_list)}", ephemeral=True)
-    
-    removed = stock_list[:quantity]
-    remaining = stock_list[quantity:]
-    
-    # Actualizamos stock
-    await update_stock(product_id, variant_id, remaining)
-    
-    # Enviamos los items al usuario por DM
-    try:
-        await user.send(f"Here are your items:\n```{chr(10).join(removed)}```")
-    except:
-        await interaction.response.send_message("⚠️ Could not DM the user.", ephemeral=True)
-    
-    # Log en canal
-    log_channel = bot.get_channel(LOGS_CHANNEL_ID)
-    if log_channel:
-        await log_channel.send(f"{interaction.user} removed {quantity} items from {product_id}/{variant_id} and sent them to {user}")
-    
-    await interaction.response.send_message(f"✅ Removed {quantity} items from `{product_id}` variant `{variant_id}` and sent to {user.mention}", ephemeral=True)
 
 # --- FLASK PARA 24/7 ---
 app = Flask("")
