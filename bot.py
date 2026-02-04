@@ -46,7 +46,14 @@ async def get_product(pid):
 async def get_stock(pid):
     url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products/{pid}/deliverables"
     status, raw, js = await request("GET", url)
-    return js if isinstance(js, list) else js.get("deliverables") if js else []
+    if isinstance(js, list):
+        return js
+    if isinstance(js, dict):
+        if "deliverables" in js and isinstance(js["deliverables"], list):
+            return js["deliverables"]
+        if "data" in js and isinstance(js["data"], list):
+            return js["data"]
+    return []
 
 async def update_stock(pid, items):
     url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products/{pid}/stock"
