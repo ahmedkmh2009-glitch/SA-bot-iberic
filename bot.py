@@ -3,16 +3,18 @@ import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
+from flask import Flask
+import threading
 
-# VARIABLES
+# --- CONFIG ---
 TOKEN = os.getenv("TOKEN")
 SELLAUTH_API_KEY = os.getenv("SELLAUTH_API_KEY")
 SELLAUTH_SHOP_ID = os.getenv("SELLAUTH_SHOP_ID")
 LOGS_CHANNEL_ID = 1456619335014547549  # Canal de logs
+OWNER_ID = 1456619228915568671  # Solo este usuario puede usar comandos
 
-# SETUP BOT
+# --- BOT ---
 intents = discord.Intents.default()
-intents.members = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 
 # --- UTILIDADES API ---
@@ -25,7 +27,7 @@ async def request(method, url, json_body=None):
             raw = await r.text()
             try:
                 js = await r.json(content_type=None)
-            except Exception:
+            except:
                 js = None
             return r.status, raw, js
 
@@ -53,7 +55,8 @@ async def get_variants(pid):
 
 async def get_stock(pid, vid):
     url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products/{pid}/deliverables/{vid}"
-    return await request("GET", url)
+    status, raw, js = await request("GET", url)
+    return js if isinstance(js, list) else js.get("deliverables") if js else []
 
 async def update_stock(pid, vid, items):
     url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products/{pid}/stock/{vid}"
@@ -64,104 +67,88 @@ async def get_invoice(invoice_id):
     status, raw, js = await request("GET", url)
     return status, js
 
-# --- INTERFACES DISCORD ---
-def split_lines(text):
-    return [x.strip() for x in text.splitlines() if x.strip()]
+# --- PERMISOS ---
+def is_owner():
+    async def predicate(interaction: discord.Interaction):
+        if interaction.user.id != OWNER_ID:
+            await interaction.response.send_message("❌ You are not authorized to use this command.", ephemeral=True)
+            return False
+        return True
+    return app_commands.check(predicate)
 
-class RestockModal(discord.ui.Modal, title="Add Stock"):
-    stock = discord.ui.TextInput(label="Stock (one per line)", style=discord.TextStyle.paragraph)
+# --- COMANDOS BOT ---
+@bot.tree.command(name="products_text")
+@is_owner()
+async def products_text(interaction: discord.Interaction):
+    """Lista todos los productos disponibles"""
+    products = await list_products()
+    if not products:
+        return await interaction.response.send_message("No products found.", ephemeral=True)
 
-    def __init__(self, pid, vid, pname, vname):
-        super().__init__()
-        self.pid = pid
-        self.vid = vid
-        self.pname = pname
-        self.vname = vname
+    message = "**Available products:**\n"
+    for p in products:
+        pid = p.get("id")
+        pname = p.get("name")
+        message += f"- `{pid}`: {pname}\n"
+    message += "\nType `/addtocart <product_id>` to add it to your command."
+    await interaction.response.send_message(message, ephemeral=True)
 
-    async def on_submit(self, interaction: discord.Interaction):
-        items = split_lines(self.stock.value)
-        if not items:
-            return await interaction.response.send_message("No stock provided", ephemeral=True)
-        await interaction.response.defer(ephemeral=True)
-        status, raw, js = await update_stock(self.pid, self.vid, items)
-        if status < 200 or status >= 300:
-            return await interaction.followup.send(f"Error updating stock: {js or raw}", ephemeral=True)
-        embed = discord.Embed(
-            title="Stock Added",
-            description=f"{self.pname} / {self.vname}\nAdded {len(items)} items",
-            color=discord.Color.green()
-        )
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-class VariantSelect(discord.ui.Select):
-    def __init__(self, action, pid, pname, variants):
-        options = [discord.SelectOption(label=v.get("name") or str(v.get("id")), value=str(v.get("id"))) for v in variants]
-        super().__init__(placeholder="Select variant", options=options)
-        self.action = action
-        self.pid = pid
-        self.pname = pname
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        vid = int(self.values[0])
-        vname = next(o.label for o in self.options if o.value == str(vid))
-        if self.action == "restock":
-            await interaction.followup.send_modal(RestockModal(self.pid, vid, self.pname, vname))
-        elif self.action == "stock":
-            status, raw, js = await get_stock(self.pid, vid)
-            stock_list = js if isinstance(js, list) else js.get("deliverables") if js else []
-            embed = discord.Embed(title=f"{self.pname} / {vname} Stock", description=f"Available: {len(stock_list)}", color=discord.Color.blurple())
-            if stock_list:
-                preview = "\n".join(stock_list[:10])
-                embed.add_field(name="Preview", value=f"```{preview}```", inline=False)
-            await interaction.followup.send(embed=embed, ephemeral=True)
-
-class VariantView(discord.ui.View):
-    def __init__(self, action, pid, pname, variants):
-        super().__init__(timeout=600)  # 10 minutos
-        self.add_item(VariantSelect(action, pid, pname, variants))
-
-class ProductSelect(discord.ui.Select):
-    def __init__(self, action, products):
-        options = [discord.SelectOption(label=p.get("name") or str(p.get("id")), value=str(p.get("id"))) for p in products]
-        super().__init__(placeholder="Select product", options=options)
-        self.action = action
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        pid = int(self.values[0])
-        pname = next(o.label for o in self.options if o.value == str(pid))
-        variants = await get_variants(pid)
-        await interaction.followup.send(embed=discord.Embed(title=pname), view=VariantView(self.action, pid, pname, variants), ephemeral=True)
-
-class ProductView(discord.ui.View):
-    def __init__(self, action, products):
-        super().__init__(timeout=600)
-        self.add_item(ProductSelect(action, products))
-
-# --- COMANDOS ---
-@bot.tree.command(name="products")
-async def products(interaction: discord.Interaction):
-    prods = await list_products()
-    await interaction.response.send_message("Select a product:", view=ProductView("stock", prods), ephemeral=True)
-
-@bot.tree.command(name="addstock")
-async def addstock(interaction: discord.Interaction):
-    prods = await list_products()
-    await interaction.response.send_message("Select a product to add stock:", view=ProductView("restock", prods), ephemeral=True)
+@bot.tree.command(name="addtocart")
+@app_commands.describe(product_id="ID of the product to add")
+@is_owner()
+async def addtocart(interaction: discord.Interaction, product_id: str):
+    """Añade un producto al comando SBS"""
+    product = await get_product(product_id)
+    if not product:
+        return await interaction.response.send_message("Product not found.", ephemeral=True)
+    
+    await interaction.response.send_message(f"✅ Added **{product.get('name')}** to your command.", ephemeral=True)
 
 @bot.tree.command(name="stock")
-async def stock(interaction: discord.Interaction):
-    prods = await list_products()
-    await interaction.response.send_message("Select a product to view stock:", view=ProductView("stock", prods), ephemeral=True)
+@app_commands.describe(product_id="ID of the product to check stock")
+@is_owner()
+async def stock(interaction: discord.Interaction, product_id: str):
+    """Muestra el stock de un producto"""
+    variants = await get_variants(product_id)
+    if not variants:
+        return await interaction.response.send_message("No variants found for this product.", ephemeral=True)
+    
+    msg = f"**Stock for {product_id}:**\n"
+    for v in variants:
+        vid = v.get("id")
+        vname = v.get("name") or str(vid)
+        stock_list = await get_stock(product_id, vid)
+        msg += f"- Variant `{vname}`: {len(stock_list)} items\n"
+        if stock_list:
+            msg += "  Preview: ```" + "\n".join(stock_list[:10]) + "```\n"
+    await interaction.response.send_message(msg, ephemeral=True)
+
+@bot.tree.command(name="addstock")
+@app_commands.describe(product_id="ID of the product", variant_id="ID of the variant", items="Items to add, comma-separated")
+@is_owner()
+async def addstock(interaction: discord.Interaction, product_id: str, variant_id: str, items: str):
+    """Añade stock a un producto"""
+    item_list = [x.strip() for x in items.split(",") if x.strip()]
+    if not item_list:
+        return await interaction.response.send_message("No items provided.", ephemeral=True)
+    status, raw, js = await update_stock(product_id, variant_id, item_list)
+    if status < 200 or status >= 300:
+        return await interaction.response.send_message(f"Error updating stock: {js or raw}", ephemeral=True)
+    await interaction.response.send_message(f"✅ Added {len(item_list)} items to product `{product_id}` variant `{variant_id}`.", ephemeral=True)
 
 @bot.tree.command(name="invoice")
 @app_commands.describe(invoice_id="Invoice ID to check")
+@is_owner()
 async def invoice(interaction: discord.Interaction, invoice_id: str):
+    """Consulta una factura"""
     status, js = await get_invoice(invoice_id)
     if status != 200:
         return await interaction.response.send_message(f"Invoice {invoice_id} not found.", ephemeral=True)
-    embed = discord.Embed(title=f"Invoice {invoice_id}", description=f"Status: {js.get('status')}\nPrice: {js.get('price')} {js.get('currency')}", color=discord.Color.green())
+    embed = discord.Embed(
+        title=f"Invoice {invoice_id}",
+        description=f"Status: {js.get('status')}\nPrice: {js.get('price')} {js.get('currency')}",
+        color=discord.Color.green()
+    )
     items = js.get("items") or []
     for it in items:
         deliverables = it.get("delivered") or []
@@ -172,66 +159,38 @@ async def invoice(interaction: discord.Interaction, invoice_id: str):
         )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# --- REPLACE ---
-class ReplaceModal(discord.ui.Modal, title="Replace Product"):
-    quantity = discord.ui.TextInput(label="Quantity to remove", style=discord.TextStyle.short)
-
-    def __init__(self, pid, vid, pname, vname, user):
-        super().__init__()
-        self.pid = pid
-        self.vid = vid
-        self.pname = pname
-        self.vname = vname
-        self.user = user
-
-    async def on_submit(self, interaction: discord.Interaction):
-        qty = int(self.quantity.value)
-        status, raw, js = await get_stock(self.pid, self.vid)
-        stock_list = js if isinstance(js, list) else js.get("deliverables") if js else []
-        if qty > len(stock_list):
-            return await interaction.response.send_message("Not enough stock to remove.", ephemeral=True)
-        removed = stock_list[:qty]
-        remaining = stock_list[qty:]
-        await update_stock(self.pid, self.vid, remaining)
-        # enviar al usuario
-        try:
-            await self.user.send(f"Here are your replaced accounts:\n```{chr(10).join(removed)}```")
-        except:
-            pass
-        # log en canal
-        log_channel = bot.get_channel(LOGS_CHANNEL_ID)
-        if log_channel:
-            await log_channel.send(f"{interaction.user} removed {qty} from {self.pname}/{self.vname} for {self.user}")
-        await interaction.response.send_message(f"Removed {qty} items and sent to {self.user.mention}", ephemeral=True)
-
-class ReplaceSelect(discord.ui.Select):
-    def __init__(self, pid, pname, variants, user):
-        options = [discord.SelectOption(label=v.get("name") or str(v.get("id")), value=str(v.get("id"))) for v in variants]
-        super().__init__(placeholder="Select variant", options=options)
-        self.pid = pid
-        self.pname = pname
-        self.user = user
-
-    async def callback(self, interaction: discord.Interaction):
-        vid = int(self.values[0])
-        vname = next(o.label for o in self.options if o.value == str(vid))
-        await interaction.response.send_modal(ReplaceModal(self.pid, vid, self.pname, vname, self.user))
-
-class ReplaceView(discord.ui.View):
-    def __init__(self, pid, pname, variants, user):
-        super().__init__()
-        self.add_item(ReplaceSelect(pid, pname, variants, user))
-
 @bot.tree.command(name="replace")
-@app_commands.describe(user="User to send removed accounts")
-async def replace(interaction: discord.Interaction, user: discord.Member):
-    prods = await list_products()
-    await interaction.response.send_message("Select product to replace:", view=ProductView("replace", prods), ephemeral=True)
+@app_commands.describe(user="Usuario al que enviar los items", product_id="ID del producto", variant_id="ID de la variante", quantity="Cantidad a remover")
+@is_owner()
+async def replace(interaction: discord.Interaction, user: discord.Member, product_id: str, variant_id: str, quantity: int):
+    """Quita items de stock y los envía a un usuario"""
+    stock_list = await get_stock(product_id, variant_id)
+    if not stock_list:
+        return await interaction.response.send_message("No stock available for this product/variant.", ephemeral=True)
+    
+    if quantity > len(stock_list):
+        return await interaction.response.send_message(f"❌ Not enough stock. Available: {len(stock_list)}", ephemeral=True)
+    
+    removed = stock_list[:quantity]
+    remaining = stock_list[quantity:]
+    
+    # Actualizamos stock
+    await update_stock(product_id, variant_id, remaining)
+    
+    # Enviamos los items al usuario por DM
+    try:
+        await user.send(f"Here are your items:\n```{chr(10).join(removed)}```")
+    except:
+        await interaction.response.send_message("⚠️ Could not DM the user.", ephemeral=True)
+    
+    # Log en canal
+    log_channel = bot.get_channel(LOGS_CHANNEL_ID)
+    if log_channel:
+        await log_channel.send(f"{interaction.user} removed {quantity} items from {product_id}/{variant_id} and sent them to {user}")
+    
+    await interaction.response.send_message(f"✅ Removed {quantity} items from `{product_id}` variant `{variant_id}` and sent to {user.mention}", ephemeral=True)
 
 # --- FLASK PARA 24/7 ---
-from flask import Flask
-import threading
-
 app = Flask("")
 
 @app.route("/")
@@ -241,7 +200,6 @@ def home():
 def run_flask():
     app.run(host="0.0.0.0", port=10000)
 
-# --- EJECUTAR FLASK EN HILO ---
 threading.Thread(target=run_flask).start()
 
 # --- START BOT ---
