@@ -55,6 +55,12 @@ async def get_stock(pid):
             return js["data"]
     return []
 
+# --- NUEVO: ADD STOCK con POST ---
+async def add_stock(pid, items):
+    url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products/{pid}/deliverables"
+    return await request("POST", url, {"deliverables": items})
+
+# --- UPDATE STOCK REEMPLAZO COMPLETO ---
 async def update_stock(pid, items):
     url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products/{pid}/stock"
     return await request("PUT", url, {"deliverables": items})
@@ -121,7 +127,7 @@ async def addstock(interaction: discord.Interaction, product_id: str, items: str
     item_list = [x.strip() for x in items.split(",") if x.strip()]
     if not item_list:
         return await interaction.response.send_message("No items provided.", ephemeral=True)
-    status, raw, js = await update_stock(product_id, item_list)
+    status, raw, js = await add_stock(product_id, item_list)  # <-- usa POST
     if status < 200 or status >= 300:
         return await interaction.response.send_message(f"Error updating stock: {js or raw}", ephemeral=True)
     await interaction.response.send_message(f"✅ Added {len(item_list)} items to {product_id}", ephemeral=True)
