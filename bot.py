@@ -9,6 +9,7 @@ import sqlite3
 import threading
 import io
 import zipfile
+import re
 from datetime import datetime, time, timedelta
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
@@ -30,7 +31,7 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 ADMIN_IDS = [int(id.strip()) for id in os.getenv('ADMIN_IDS', '').split(',') if id.strip()]
 BOT_OWNER = "@iberic_owner"  # ✅ CHANGED TO YOUR USERNAME
 BOT_NAME = "🔍 ULP Searcher Bot"
-BOT_VERSION = "4.2 ENGLISH"
+BOT_VERSION = "4.3 ENGLISH"
 MAX_FREE_CREDITS = 3  # ✅ 3 daily credits per user
 RESET_HOUR = 0  # Reset hour (0 = midnight)
 
@@ -75,7 +76,7 @@ def health():
     return jsonify({"status": "healthy"})
 
 # ============================================================================
-# SEARCH ENGINE
+# SEARCH ENGINE - MEJORADO
 # ============================================================================
 
 class SearchEngine:
@@ -89,6 +90,7 @@ class SearchEngine:
         logger.info(f"📂 Loaded {len(self.data_files)} files")
     
     def search_domain(self, domain: str, max_results: int = 5000) -> Tuple[int, List[str]]:
+        """Search for domain anywhere in the line"""
         results = []
         domain_lower = domain.lower()
         
@@ -117,8 +119,22 @@ class SearchEngine:
         return len(results), results
     
     def search_email(self, email: str, max_results: int = 1000) -> Tuple[int, List[str]]:
+        """
+        Search for email and return results in email:pass format
+        
+        Supports formats like:
+        - email:pass
+        - email|pass
+        - email;pass
+        - email pass
+        - email\tpass
+        """
         results = []
-        email_lower = email.lower()
+        email_lower = email.lower().strip()
+        
+        # Remove @ symbol if user included it
+        if email_lower.startswith('@'):
+            email_lower = email_lower[1:]
         
         for file_path in self.data_files:
             if len(results) >= max_results:
@@ -131,9 +147,15 @@ class SearchEngine:
                         if not line:
                             continue
                         
-                        # Search specific email
-                        if email_lower in line.lower():
-                            results.append(line)
+                        # Normalize line to handle different separators
+                        normalized_line = self.normalize_credentials_line(line)
+                        
+                        # Check if email is in the line
+                        if email_lower in normalized_line.lower():
+                            # Extract email:pass format
+                            email_pass_line = self.extract_email_pass(line, email_lower)
+                            if email_pass_line:
+                                results.append(email_pass_line)
                         
                         if len(results) >= max_results:
                             break
@@ -143,6 +165,64 @@ class SearchEngine:
                 continue
         
         return len(results), results
+    
+    def normalize_credentials_line(self, line: str) -> str:
+        """Normalize different credential formats to email:pass format"""
+        # Replace common separators with colon
+        line = line.replace('|', ':')
+        line = line.replace(';', ':')
+        line = line.replace('\t', ':')
+        
+        # Replace multiple spaces with colon
+        if ' ' in line and ':' not in line:
+            parts = line.split()
+            if len(parts) >= 2:
+                line = f"{parts[0]}:{parts[1]}"
+        
+        return line
+    
+    def extract_email_pass(self, original_line: str, search_email: str) -> str:
+        """
+        Extract email:password from a line
+        Returns formatted string or empty if not found
+        """
+        # Try to find email and password in the line
+        line_lower = original_line.lower()
+        
+        # Check different formats
+        formats_to_try = [':', '|', ';', '\t', ' ']
+        
+        for separator in formats_to_try:
+            if separator in original_line:
+                parts = original_line.split(separator)
+                if len(parts) >= 2:
+                    # Check if first part contains the email
+                    if search_email in parts[0].lower():
+                        return f"{parts[0].strip()}:{parts[1].strip()}"
+                    # Check if email is in any part
+                    for i in range(len(parts)):
+                        if search_email in parts[i].lower() and i < len(parts) - 1:
+                            return f"{parts[i].strip()}:{parts[i+1].strip()}"
+        
+        # If no separator found, try to extract email pattern
+        email_pattern = r'[\w\.-]+@[\w\.-]+\.\w+'
+        emails = re.findall(email_pattern, original_line, re.IGNORECASE)
+        
+        if emails:
+            # Take the first email that matches
+            for email in emails:
+                if search_email in email.lower():
+                    # Try to extract password after email
+                    idx = original_line.lower().find(email.lower())
+                    if idx != -1:
+                        remaining = original_line[idx + len(email):].strip()
+                        # Take first word after email as password
+                        if remaining:
+                            # Remove any separators
+                            password = re.split(r'[:|;\s\t]', remaining)[0]
+                            return f"{email.strip()}:{password.strip()}"
+        
+        return original_line.strip()
     
     def search_dni(self, dni: str, max_results: int = 1000) -> Tuple[int, List[str]]:
         results = []
@@ -190,7 +270,7 @@ class SearchEngine:
             return False, str(e)
 
 # ============================================================================
-# CREDIT SYSTEM WITH DAILY RESET (3 CREDITS)
+# CREDIT SYSTEM WITH DAILY RESET (3 CREDITS) - SIN CAMBIOS
 # ============================================================================
 
 class CreditSystem:
@@ -212,7 +292,7 @@ class CreditSystem:
                     user_id INTEGER PRIMARY KEY,
                     username TEXT,
                     first_name TEXT,
-                    daily_credits INTEGER DEFAULT 3,  -- ✅ 3 daily credits
+                    daily_credits INTEGER DEFAULT 3,
                     extra_credits INTEGER DEFAULT 0,
                     total_searches INTEGER DEFAULT 0,
                     join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -250,20 +330,18 @@ class CreditSystem:
             user = cursor.fetchone()
             
             if user:
-                # Check if daily reset is needed
                 self.check_daily_reset(user_id)
                 return dict(user)
             
-            # New user - ✅ 3 INITIAL CREDITS
             cursor.execute('''
                 INSERT INTO users (user_id, username, first_name, daily_credits, last_reset)
-                VALUES (?, ?, ?, 3, DATE('now'))  -- ✅ 3 initial credits
+                VALUES (?, ?, ?, 3, DATE('now'))
             ''', (user_id, username, first_name))
             
             cursor.execute('''
                 INSERT INTO transactions (user_id, amount, type, description)
                 VALUES (?, ?, ?, ?)
-            ''', (user_id, 3, 'daily_reset', '3 daily initial credits'))  -- ✅ 3 credits
+            ''', (user_id, 3, 'daily_reset', '3 daily initial credits'))
             
             conn.commit()
             
@@ -271,12 +349,11 @@ class CreditSystem:
                 'user_id': user_id,
                 'username': username,
                 'first_name': first_name,
-                'daily_credits': 3,  -- ✅ 3 credits
+                'daily_credits': 3,
                 'extra_credits': 0
             }
     
     def check_daily_reset(self, user_id: int):
-        """Check and apply daily reset if needed"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             
@@ -290,11 +367,10 @@ class CreditSystem:
                 last_reset = result['last_reset']
                 today = datetime.now().date()
                 
-                # If not today, reset daily credits to 3
                 if last_reset != str(today):
                     cursor.execute('''
                         UPDATE users 
-                        SET daily_credits = 3,  -- ✅ RESET TO 3 CREDITS
+                        SET daily_credits = 3,
                             last_reset = DATE('now')
                         WHERE user_id = ?
                     ''', (user_id,))
@@ -302,7 +378,7 @@ class CreditSystem:
                     cursor.execute('''
                         INSERT INTO transactions (user_id, amount, type, description)
                         VALUES (?, ?, ?, ?)
-                    ''', (user_id, 3, 'daily_reset', 'Daily reset to 3 credits'))  -- ✅ 3 credits
+                    ''', (user_id, 3, 'daily_reset', 'Daily reset to 3 credits'))
                     
                     conn.commit()
                     logger.info(f"🔄 Credits reset to 3 for user {user_id}")
@@ -317,10 +393,8 @@ class CreditSystem:
             result = cursor.fetchone()
             
             if result:
-                # Check reset first
                 self.check_daily_reset(user_id)
                 
-                # Get updated credits
                 cursor.execute(
                     'SELECT daily_credits, extra_credits FROM users WHERE user_id = ?',
                     (user_id,)
@@ -331,7 +405,6 @@ class CreditSystem:
             return 0
     
     def get_daily_credits_left(self, user_id: int) -> int:
-        """Get remaining daily credits"""
         self.check_daily_reset(user_id)
         
         with self.get_connection() as conn:
@@ -347,7 +420,6 @@ class CreditSystem:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             
-            # Check reset first
             self.check_daily_reset(user_id)
             
             cursor.execute(
@@ -362,7 +434,6 @@ class CreditSystem:
             daily_credits = result['daily_credits']
             extra_credits = result['extra_credits']
             
-            # Determine which credits to use first
             if daily_credits > 0:
                 new_daily = daily_credits - 1
                 new_extra = extra_credits
@@ -392,13 +463,11 @@ class CreditSystem:
             return True
     
     def reset_all_daily_credits(self):
-        """Reset daily credits for all users (run at midnight)"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             
             today = datetime.now().date()
             
-            # Get users who need reset
             cursor.execute('''
                 SELECT COUNT(*) as count FROM users 
                 WHERE last_reset != DATE(?) OR last_reset IS NULL
@@ -406,15 +475,13 @@ class CreditSystem:
             users_to_reset = cursor.fetchone()['count']
             
             if users_to_reset > 0:
-                # Reset daily credits
                 cursor.execute('''
                     UPDATE users 
-                    SET daily_credits = 3,  -- ✅ RESET TO 3 CREDITS
+                    SET daily_credits = 3,
                         last_reset = DATE(?)
                     WHERE last_reset != DATE(?) OR last_reset IS NULL
                 ''', (today, today))
                 
-                # Log the reset
                 cursor.execute('''
                     INSERT INTO daily_resets (reset_date, users_reset)
                     VALUES (?, ?)
@@ -427,7 +494,6 @@ class CreditSystem:
             return 0
     
     def add_credits_to_user(self, user_id: int, amount: int, admin_id: int, credit_type: str = 'extra') -> Tuple[bool, str]:
-        """Add extra credits to user (don't reset)"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             
@@ -445,7 +511,7 @@ class CreditSystem:
                     'UPDATE users SET extra_credits = extra_credits + ? WHERE user_id = ?',
                     (amount, user_id)
                 )
-            else:  # daily
+            else:
                 cursor.execute(
                     'UPDATE users SET daily_credits = daily_credits + ? WHERE user_id = ?',
                     (amount, user_id)
@@ -493,7 +559,7 @@ class CreditSystem:
             return stats
 
 # ============================================================================
-# MAIN BOT
+# MAIN BOT - MEJORADO PARA EMAIL:PASS
 # ============================================================================
 
 class ULPBot:
@@ -526,7 +592,7 @@ class ULPBot:
         
         keyboard = [
             [InlineKeyboardButton("🔍 Search Domain", callback_data="menu_search")],
-            [InlineKeyboardButton("📧 Search Email", callback_data="menu_email")],
+            [InlineKeyboardButton("📧 Search Email (email:pass)", callback_data="menu_email")],  # ✅ Actualizado
             [InlineKeyboardButton("💰 My Credits", callback_data="menu_credits")],
             [InlineKeyboardButton("📋 /help", callback_data="menu_help")],
         ]
@@ -545,7 +611,7 @@ class ULPBot:
             f"• Extra: {extra_credits}\n"
             f"• Total: {total_credits}\n\n"
             f"<b>Database:</b> {stats['total_files']} files loaded\n\n"
-            f"Use the buttons below to search or check your credits."
+            f"<b>Email search returns results in email:password format!</b>"
         )
         
         await update.message.reply_html(message, reply_markup=reply_markup)
@@ -557,11 +623,15 @@ class ULPBot:
             "/start - Start the bot\n"
             "/credits - Check your credits\n"
             "/stats - Bot statistics\n"
-            "/help - This help message\n\n"
+            "/help - This help message\n"
+            "/domain <domain> - Search for domain\n"
+            "/email <email> - Search for email (returns email:password)\n\n"
             
             "<b>How to Search:</b>\n"
             "1. Use /domain <domain> to search for a domain\n"
             "2. Use /email <email> to search for an email\n"
+            "   • Returns results in email:password format\n"
+            "   • Supports: email:pass, email|pass, email;pass\n"
             "3. Or use the buttons in the main menu\n\n"
             
             "<b>Credits System:</b>\n"
@@ -637,18 +707,24 @@ class ULPBot:
             return
         
         # Send initial message
-        message = await update.message.reply_html(f"🔍 Searching for: <code>{self.escape_html(display_query)}</code>\n⏳ Please wait...")
+        message = await update.message.reply_html(
+            f"🔍 Searching for: <code>{self.escape_html(display_query)}</code>\n"
+            f"⏳ Please wait..."
+        )
         
         try:
             # Perform search
             if search_type == 'domain':
                 count, results = self.search_engine.search_domain(query)
+                result_type = "domain matches"
             elif search_type == 'email':
                 count, results = self.search_engine.search_email(query)
+                result_type = "email:password pairs"
             elif search_type == 'dni':
                 count, results = self.search_engine.search_dni(query)
+                result_type = "DNI matches"
             else:
-                await message.edit_text(f"❌ Invalid search type")
+                await message.edit_text("❌ Invalid search type")
                 return
             
             # Use credits
@@ -665,7 +741,7 @@ class ULPBot:
                 await message.edit_text(
                     f"🔍 <b>Search Results</b>\n\n"
                     f"<b>Query:</b> <code>{self.escape_html(display_query)}</code>\n"
-                    f"<b>Results:</b> 0\n\n"
+                    f"<b>Results:</b> 0 {result_type}\n\n"
                     f"No results found for your search.\n\n"
                     f"<i>Daily credits remaining: {daily_credits}/3</i>"
                 )
@@ -678,24 +754,25 @@ class ULPBot:
                 await message.edit_text(
                     f"🔍 <b>Search Results</b>\n\n"
                     f"<b>Query:</b> <code>{self.escape_html(display_query)}</code>\n"
-                    f"<b>Results:</b> {count}\n\n"
+                    f"<b>Results:</b> {count} {result_type}\n\n"
                     f"<pre>{results_text}</pre>\n\n"
                     f"<i>Daily credits remaining: {daily_credits}/3</i>"
                 )
             else:
                 # Send as file
                 results_text = "\n".join(results[:1000])
-                file_content = f"Query: {query}\nTotal Results: {count}\n\n{results_text}"
+                file_content = f"Query: {query}\nTotal Results: {count}\nType: {result_type}\n\n{results_text}"
                 
                 file_obj = io.BytesIO(file_content.encode('utf-8'))
-                file_obj.name = f"{search_type}_{query}_{count}_results.txt"
+                filename = f"{search_type}_{query.replace('@', '_at_').replace('.', '_dot_')}_{count}_results.txt"
+                file_obj.name = filename
                 
                 await update.message.reply_document(
                     document=file_obj,
                     caption=(
                         f"🔍 <b>Search Results</b>\n\n"
                         f"<b>Query:</b> <code>{self.escape_html(display_query)}</code>\n"
-                        f"<b>Results:</b> {count}\n\n"
+                        f"<b>Results:</b> {count} {result_type}\n\n"
                         f"<i>Daily credits remaining: {daily_credits}/3</i>"
                     ),
                     parse_mode='HTML'
@@ -741,9 +818,12 @@ class ULPBot:
             await query.edit_message_text(
                 "📧 <b>Email Search</b>\n\n"
                 "Send me an email address to search for.\n\n"
+                "<b>Returns results in email:password format!</b>\n\n"
                 "<i>Examples:</i>\n"
                 "<code>user@example.com</code>\n"
-                "<code>name@gmail.com</code>",
+                "<code>name@gmail.com</code>\n"
+                "<code>@hotmail.com</code> (for all hotmail)\n\n"
+                "<i>Supports: email:pass, email|pass, email;pass</i>",
                 parse_mode='HTML'
             )
             context.user_data['awaiting_search'] = 'email'
@@ -859,11 +939,9 @@ async def daily_reset_job(context: ContextTypes.DEFAULT_TYPE):
     logger.info("🔄 Running daily credit reset...")
     
     try:
-        # Get bot instance from context
         if hasattr(context, 'bot_data') and 'ulp_bot' in context.bot_data:
             credit_system = context.bot_data['ulp_bot'].credit_system
         else:
-            # Fallback: create new instance
             credit_system = CreditSystem()
         
         users_reset = credit_system.reset_all_daily_credits()
@@ -888,7 +966,6 @@ def run():
     # Setup daily reset job
     job_queue = application.job_queue
     if job_queue:
-        # Schedule daily reset at midnight UTC
         job_queue.run_daily(
             daily_reset_job,
             time(hour=RESET_HOUR, minute=0, second=0),
