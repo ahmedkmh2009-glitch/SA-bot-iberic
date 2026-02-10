@@ -29,11 +29,11 @@ from telegram.ext import (
 
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 ADMIN_IDS = [int(id.strip()) for id in os.getenv('ADMIN_IDS', '').split(',') if id.strip()]
-BOT_OWNER = "@iberic_owner"  # ✅ CHANGED TO YOUR USERNAME
+BOT_OWNER = "@iberic_owner"
 BOT_NAME = "🔍 ULP Searcher Bot"
-BOT_VERSION = "4.3 ENGLISH"
-MAX_FREE_CREDITS = 3  # ✅ 3 daily credits per user
-RESET_HOUR = 0  # Reset hour (0 = midnight)
+BOT_VERSION = "4.5 ENGLISH"
+MAX_FREE_CREDITS = 3
+RESET_HOUR = 0
 
 PORT = int(os.getenv('PORT', 10000))
 
@@ -44,8 +44,6 @@ DB_PATH = os.path.join(BASE_DIR, "bot.db")
 
 for directory in [BASE_DIR, DATA_DIR, UPLOAD_DIR]:
     os.makedirs(directory, exist_ok=True)
-
-CHOOSING_FORMAT, ADMIN_ADD_CREDITS = range(2)
 
 # ============================================================================
 # LOGGING
@@ -76,7 +74,7 @@ def health():
     return jsonify({"status": "healthy"})
 
 # ============================================================================
-# SEARCH ENGINE - MEJORADO
+# SEARCH ENGINE - CON EXTRACCIÓN DE EMAIL:PASS
 # ============================================================================
 
 class SearchEngine:
@@ -90,7 +88,7 @@ class SearchEngine:
         logger.info(f"📂 Loaded {len(self.data_files)} files")
     
     def search_domain(self, domain: str, max_results: int = 5000) -> Tuple[int, List[str]]:
-        """Search for domain anywhere in the line"""
+        """Search for domain - returns ALL lines including URLs"""
         results = []
         domain_lower = domain.lower()
         
@@ -110,7 +108,7 @@ class SearchEngine:
                             results.append(line)
                         
                         if len(results) >= max_results:
-                            break
+                        break
             
             except Exception as e:
                 logger.error(f"Error in {file_path}: {e}")
@@ -118,23 +116,17 @@ class SearchEngine:
         
         return len(results), results
     
-    def search_email(self, email: str, max_results: int = 1000) -> Tuple[int, List[str]]:
+    def search_email_clean(self, email_or_domain: str, max_results: int = 1000) -> Tuple[int, List[str]]:
         """
-        Search for email and return results in email:pass format
-        
-        Supports formats like:
-        - email:pass
-        - email|pass
-        - email;pass
-        - email pass
-        - email\tpass
+        Search for email and return CLEAN email:pass format
+        Removes URLs from lines like: url:email:pass
         """
         results = []
-        email_lower = email.lower().strip()
+        search_term = email_or_domain.lower().strip()
         
         # Remove @ symbol if user included it
-        if email_lower.startswith('@'):
-            email_lower = email_lower[1:]
+        if search_term.startswith('@'):
+            search_term = search_term[1:]
         
         for file_path in self.data_files:
             if len(results) >= max_results:
@@ -147,101 +139,14 @@ class SearchEngine:
                         if not line:
                             continue
                         
-                        # Normalize line to handle different separators
-                        normalized_line = self.normalize_credentials_line(line)
+                        line_lower = line.lower()
                         
-                        # Check if email is in the line
-                        if email_lower in normalized_line.lower():
-                            # Extract email:pass format
-                            email_pass_line = self.extract_email_pass(line, email_lower)
-                            if email_pass_line:
-                                results.append(email_pass_line)
-                        
-                        if len(results) >= max_results:
-                            break
-            
-            except Exception as e:
-                logger.error(f"Error in {file_path}: {e}")
-                continue
-        
-        return len(results), results
-    
-    def normalize_credentials_line(self, line: str) -> str:
-        """Normalize different credential formats to email:pass format"""
-        # Replace common separators with colon
-        line = line.replace('|', ':')
-        line = line.replace(';', ':')
-        line = line.replace('\t', ':')
-        
-        # Replace multiple spaces with colon
-        if ' ' in line and ':' not in line:
-            parts = line.split()
-            if len(parts) >= 2:
-                line = f"{parts[0]}:{parts[1]}"
-        
-        return line
-    
-    def extract_email_pass(self, original_line: str, search_email: str) -> str:
-        """
-        Extract email:password from a line
-        Returns formatted string or empty if not found
-        """
-        # Try to find email and password in the line
-        line_lower = original_line.lower()
-        
-        # Check different formats
-        formats_to_try = [':', '|', ';', '\t', ' ']
-        
-        for separator in formats_to_try:
-            if separator in original_line:
-                parts = original_line.split(separator)
-                if len(parts) >= 2:
-                    # Check if first part contains the email
-                    if search_email in parts[0].lower():
-                        return f"{parts[0].strip()}:{parts[1].strip()}"
-                    # Check if email is in any part
-                    for i in range(len(parts)):
-                        if search_email in parts[i].lower() and i < len(parts) - 1:
-                            return f"{parts[i].strip()}:{parts[i+1].strip()}"
-        
-        # If no separator found, try to extract email pattern
-        email_pattern = r'[\w\.-]+@[\w\.-]+\.\w+'
-        emails = re.findall(email_pattern, original_line, re.IGNORECASE)
-        
-        if emails:
-            # Take the first email that matches
-            for email in emails:
-                if search_email in email.lower():
-                    # Try to extract password after email
-                    idx = original_line.lower().find(email.lower())
-                    if idx != -1:
-                        remaining = original_line[idx + len(email):].strip()
-                        # Take first word after email as password
-                        if remaining:
-                            # Remove any separators
-                            password = re.split(r'[:|;\s\t]', remaining)[0]
-                            return f"{email.strip()}:{password.strip()}"
-        
-        return original_line.strip()
-    
-    def search_dni(self, dni: str, max_results: int = 1000) -> Tuple[int, List[str]]:
-        results = []
-        dni_lower = dni.lower()
-        
-        for file_path in self.data_files:
-            if len(results) >= max_results:
-                break
-            
-            try:
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        
-                        # Search DNI anywhere
-                        if dni_lower in line.lower():
-                            results.append(line)
+                        # Check if search term is in the line
+                        if search_term in line_lower:
+                            # Extract clean email:pass from the line
+                            clean_result = self.extract_clean_email_pass(line, search_term)
+                            if clean_result:
+                                results.append(clean_result)
                         
                         if len(results) >= max_results:
                             break
@@ -250,7 +155,67 @@ class SearchEngine:
                 logger.error(f"Error in {file_path}: {e}")
                 continue
         
-        return len(results), results
+        # Remove duplicates
+        unique_results = []
+        seen = set()
+        for result in results:
+            if result not in seen:
+                seen.add(result)
+                unique_results.append(result)
+        
+        return len(unique_results), unique_results[:max_results]
+    
+    def extract_clean_email_pass(self, line: str, search_term: str) -> Optional[str]:
+        """
+        Extract clean email:password from a line
+        Handles formats like:
+        - url:email:pass
+        - http://site.com:email:pass
+        - email:pass
+        - email|pass
+        Returns: email:password (cleaned) or None
+        """
+        # First, try to find email:password patterns
+        email_patterns = [
+            # Pattern for email:pass (with optional spaces)
+            r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\s*[:|;]\s*([^\s]+)',
+            # Pattern for email:pass after URL
+            r'[a-zA-Z0-9.-]+\.(com|net|org|edu|gov|io|co|uk|de|fr|es|it|ru|br|ca|au|in|jp|cn)\s*[:|;]\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\s*[:|;]\s*([^\s]+)',
+            # Pattern for URL:email:pass
+            r'(?:https?://)?(?:www\.)?[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:/\S*)?\s*[:|;]\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\s*[:|;]\s*([^\s]+)',
+        ]
+        
+        for pattern in email_patterns:
+            matches = re.findall(pattern, line, re.IGNORECASE)
+            for match in matches:
+                if len(match) == 2:
+                    email, password = match
+                elif len(match) == 3:
+                    # For patterns that capture domain, email, password
+                    _, email, password = match
+                else:
+                    continue
+                
+                # Check if search term matches email or domain
+                email_lower = email.lower()
+                if search_term in email_lower or f"@{search_term}" in email_lower:
+                    return f"{email}:{password}"
+        
+        # If no pattern matched, try simple splitting
+        parts = re.split(r'[:|;]', line)
+        if len(parts) >= 3:
+            # Likely format: something:email:pass
+            for i in range(len(parts) - 1):
+                # Check if this part looks like an email
+                if '@' in parts[i] and '.' in parts[i]:
+                    email = parts[i].strip()
+                    password = parts[i + 1].strip()
+                    email_lower = email.lower()
+                    
+                    if search_term in email_lower or f"@{search_term}" in email_lower:
+                        return f"{email}:{password}"
+        
+        return None
     
     def get_stats(self) -> Dict:
         return {
@@ -270,7 +235,7 @@ class SearchEngine:
             return False, str(e)
 
 # ============================================================================
-# CREDIT SYSTEM WITH DAILY RESET (3 CREDITS) - SIN CAMBIOS
+# CREDIT SYSTEM (SAME AS BEFORE)
 # ============================================================================
 
 class CreditSystem:
@@ -559,7 +524,7 @@ class CreditSystem:
             return stats
 
 # ============================================================================
-# MAIN BOT - MEJORADO PARA EMAIL:PASS
+# MAIN BOT - CON BÚSQUEDA LIMPIA
 # ============================================================================
 
 class ULPBot:
@@ -591,8 +556,8 @@ class ULPBot:
         stats = self.search_engine.get_stats()
         
         keyboard = [
-            [InlineKeyboardButton("🔍 Search Domain", callback_data="menu_search")],
-            [InlineKeyboardButton("📧 Search Email (email:pass)", callback_data="menu_email")],  # ✅ Actualizado
+            [InlineKeyboardButton("🔍 Search Domain (full lines)", callback_data="menu_search_domain")],
+            [InlineKeyboardButton("📧 Search Email (clean email:pass)", callback_data="menu_search_email")],
             [InlineKeyboardButton("💰 My Credits", callback_data="menu_credits")],
             [InlineKeyboardButton("📋 /help", callback_data="menu_help")],
         ]
@@ -611,7 +576,9 @@ class ULPBot:
             f"• Extra: {extra_credits}\n"
             f"• Total: {total_credits}\n\n"
             f"<b>Database:</b> {stats['total_files']} files loaded\n\n"
-            f"<b>Email search returns results in email:password format!</b>"
+            f"<b>Two search modes:</b>\n"
+            f"1. <b>Domain Search</b> - Full lines with URLs\n"
+            f"2. <b>Email Search</b> - Clean email:password only"
         )
         
         await update.message.reply_html(message, reply_markup=reply_markup)
@@ -624,15 +591,20 @@ class ULPBot:
             "/credits - Check your credits\n"
             "/stats - Bot statistics\n"
             "/help - This help message\n"
-            "/domain <domain> - Search for domain\n"
-            "/email <email> - Search for email (returns email:password)\n\n"
+            "/domain <domain> - Search for domain (full lines)\n"
+            "/email <email/domain> - Search for email (clean email:pass)\n\n"
             
-            "<b>How to Search:</b>\n"
-            "1. Use /domain <domain> to search for a domain\n"
-            "2. Use /email <email> to search for an email\n"
-            "   • Returns results in email:password format\n"
-            "   • Supports: email:pass, email|pass, email;pass\n"
-            "3. Or use the buttons in the main menu\n\n"
+            "<b>Two Search Types:</b>\n"
+            "1. <b>Domain Search</b>\n"
+            "   • Shows full lines including URLs\n"
+            "   • Example: /domain example.com\n"
+            "   • Shows: http://example.com:user@mail.com:pass123\n\n"
+            
+            "2. <b>Email Search</b>\n"
+            "   • Shows ONLY clean email:password\n"
+            "   • Removes URLs automatically\n"
+            "   • Example: /email gmail.com\n"
+            "   • Shows: user@gmail.com:password123\n\n"
             
             "<b>Credits System:</b>\n"
             f"• Every user gets {MAX_FREE_CREDITS} credits per day\n"
@@ -695,11 +667,11 @@ class ULPBot:
         user = update.effective_user
         
         if not context.args:
-            await update.message.reply_html("Please provide an email to search. Example: /email user@example.com")
+            await update.message.reply_html("Please provide an email or domain to search. Example: /email gmail.com")
             return
         
-        email = ' '.join(context.args)
-        await self.perform_search(update, user.id, 'email', email, email)
+        query = ' '.join(context.args)
+        await self.perform_search(update, user.id, 'email', query, query)
     
     async def perform_search(self, update: Update, user_id: int, search_type: str, query: str, display_query: str):
         if not self.credit_system.has_enough_credits(user_id):
@@ -713,16 +685,15 @@ class ULPBot:
         )
         
         try:
-            # Perform search
+            # Perform search based on type
             if search_type == 'domain':
                 count, results = self.search_engine.search_domain(query)
                 result_type = "domain matches"
+                description = "Full lines with URLs"
             elif search_type == 'email':
-                count, results = self.search_engine.search_email(query)
-                result_type = "email:password pairs"
-            elif search_type == 'dni':
-                count, results = self.search_engine.search_dni(query)
-                result_type = "DNI matches"
+                count, results = self.search_engine.search_email_clean(query)
+                result_type = "clean email:password pairs"
+                description = "URLs removed, only email:pass"
             else:
                 await message.edit_text("❌ Invalid search type")
                 return
@@ -741,7 +712,8 @@ class ULPBot:
                 await message.edit_text(
                     f"🔍 <b>Search Results</b>\n\n"
                     f"<b>Query:</b> <code>{self.escape_html(display_query)}</code>\n"
-                    f"<b>Results:</b> 0 {result_type}\n\n"
+                    f"<b>Type:</b> {description}\n"
+                    f"<b>Results:</b> 0\n\n"
                     f"No results found for your search.\n\n"
                     f"<i>Daily credits remaining: {daily_credits}/3</i>"
                 )
@@ -754,6 +726,7 @@ class ULPBot:
                 await message.edit_text(
                     f"🔍 <b>Search Results</b>\n\n"
                     f"<b>Query:</b> <code>{self.escape_html(display_query)}</code>\n"
+                    f"<b>Type:</b> {description}\n"
                     f"<b>Results:</b> {count} {result_type}\n\n"
                     f"<pre>{results_text}</pre>\n\n"
                     f"<i>Daily credits remaining: {daily_credits}/3</i>"
@@ -761,7 +734,7 @@ class ULPBot:
             else:
                 # Send as file
                 results_text = "\n".join(results[:1000])
-                file_content = f"Query: {query}\nTotal Results: {count}\nType: {result_type}\n\n{results_text}"
+                file_content = f"Query: {query}\nType: {description}\nTotal Results: {count}\n\n{results_text}"
                 
                 file_obj = io.BytesIO(file_content.encode('utf-8'))
                 filename = f"{search_type}_{query.replace('@', '_at_').replace('.', '_dot_')}_{count}_results.txt"
@@ -772,6 +745,7 @@ class ULPBot:
                     caption=(
                         f"🔍 <b>Search Results</b>\n\n"
                         f"<b>Query:</b> <code>{self.escape_html(display_query)}</code>\n"
+                        f"<b>Type:</b> {description}\n"
                         f"<b>Results:</b> {count} {result_type}\n\n"
                         f"<i>Daily credits remaining: {daily_credits}/3</i>"
                     ),
@@ -802,28 +776,34 @@ class ULPBot:
         
         user = update.effective_user
         
-        if query.data == "menu_search":
+        if query.data == "menu_search_domain":
             await query.edit_message_text(
-                "🔍 <b>Domain Search</b>\n\n"
+                "🔍 <b>Domain Search (Full Lines)</b>\n\n"
                 "Send me a domain to search for.\n\n"
+                "<b>Shows complete lines including URLs:</b>\n"
+                "<code>http://example.com:user@mail.com:pass123</code>\n\n"
                 "<i>Examples:</i>\n"
                 "<code>example.com</code>\n"
                 "<code>gmail.com</code>\n"
-                "<code>@hotmail.com</code>",
+                "<code>@hotmail.com</code>\n\n"
+                "<i>Use this to see complete database entries</i>",
                 parse_mode='HTML'
             )
             context.user_data['awaiting_search'] = 'domain'
             
-        elif query.data == "menu_email":
+        elif query.data == "menu_search_email":
             await query.edit_message_text(
-                "📧 <b>Email Search</b>\n\n"
-                "Send me an email address to search for.\n\n"
-                "<b>Returns results in email:password format!</b>\n\n"
+                "📧 <b>Email Search (Clean Format)</b>\n\n"
+                "Send me an email or domain to search for.\n\n"
+                "<b>Returns ONLY clean email:password format:</b>\n"
+                "<code>user@gmail.com:password123</code>\n\n"
+                "<b>Automatically removes URLs:</b>\n"
+                "From: <code>http://site.com:user@gmail.com:pass123</code>\n"
+                "To: <code>user@gmail.com:pass123</code>\n\n"
                 "<i>Examples:</i>\n"
                 "<code>user@example.com</code>\n"
-                "<code>name@gmail.com</code>\n"
-                "<code>@hotmail.com</code> (for all hotmail)\n\n"
-                "<i>Supports: email:pass, email|pass, email;pass</i>",
+                "<code>gmail.com</code> (all gmail accounts)\n"
+                "<code>@hotmail.com</code>\n",
                 parse_mode='HTML'
             )
             context.user_data['awaiting_search'] = 'email'
