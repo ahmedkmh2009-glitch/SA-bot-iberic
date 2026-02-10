@@ -1,6 +1,6 @@
 """
-ULP Searcher Bot - COMPLETE VERSION
-All commands + Single File output + DNI search + Clean formats
+ULP Searcher Bot - FIXED VERSION
+Corrección: Sin límite de líneas + Email:Pass sin URLs
 """
 
 import os
@@ -33,7 +33,7 @@ ADMIN_IDS = [int(id.strip()) for id in os.getenv('ADMIN_IDS', '').split(',') if 
 BOT_OWNER = "@iberic_owner"
 BOT_SUPPORT = "@iberic_owner"
 BOT_NAME = "🔍 ULP Searcher Bot"
-BOT_VERSION = "10.0 COMPLETE"
+BOT_VERSION = "10.1 FIXED"
 MAX_FREE_CREDITS = 2
 REFERRAL_CREDITS = 1
 RESET_HOUR = 0
@@ -66,25 +66,11 @@ print("="*60)
 print(f"🚀 Starting {BOT_NAME} v{BOT_VERSION}")
 print(f"👑 Owner: {BOT_OWNER}")
 print(f"💰 Free credits: {MAX_FREE_CREDITS} (resets at {RESET_HOUR}:00)")
-print(f"📁 ALL RESULTS IN ONE FILE + All commands")
+print(f"📁 ALL RESULTS - NO LIMIT + Clean Email:Pass")
 print("="*60)
 
 # ============================================================================
-# FLASK APP
-# ============================================================================
-
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return jsonify({"status": "online", "bot": BOT_NAME})
-
-@app.route('/health')
-def health():
-    return jsonify({"status": "healthy"})
-
-# ============================================================================
-# SEARCH ENGINE - COMPLETE WITH CLEAN FORMATS
+# SEARCH ENGINE - FIXED: NO LIMITS + CLEAN FORMAT
 # ============================================================================
 
 class SearchEngine:
@@ -98,7 +84,7 @@ class SearchEngine:
         logger.info(f"📂 Loaded {len(self.data_files)} files")
     
     def search_all_formats(self, query: str) -> Tuple[int, List[str]]:
-        """Search for query - returns ALL lines (with URLs)"""
+        """Search for query - returns ALL lines (NO LIMIT)"""
         results = []
         query_lower = query.lower()
         
@@ -122,7 +108,7 @@ class SearchEngine:
     def search_clean_email_pass_no_url(self, query: str) -> Tuple[int, List[str]]:
         """
         Search for query and return CLEAN email:pass format ONLY
-        REMOVES ALL URLs and keeps only email:password
+        REMOVES ALL URLs completely - FIXED VERSION
         """
         results = []
         search_term = query.lower().strip()
@@ -142,12 +128,19 @@ class SearchEngine:
                         
                         # Check if search term is in line
                         if search_term in line_lower:
-                            # Extract ALL email:password pairs from line
-                            email_pass_pairs = self.extract_all_email_pass_pairs(line)
-                            for email, password in email_pass_pairs:
+                            # Extract CLEAN email:password pairs (NO URLs at all)
+                            clean_pairs = self.extract_clean_email_pass_no_url(line)
+                            
+                            for email, password in clean_pairs:
                                 # Check if email contains the search term
-                                if search_term in email.lower() or f"@{search_term}" in email.lower():
-                                    results.append(f"{email}:{password}")
+                                email_lower = email.lower()
+                                if (search_term in email_lower or 
+                                    f"@{search_term}" in email_lower or
+                                    search_term == email_lower.split('@')[-1] if '@' in email_lower else False):
+                                    
+                                    # Add only if it's a valid pair
+                                    if email and password:
+                                        results.append(f"{email}:{password}")
             except Exception as e:
                 logger.error(f"Error in {file_path}: {e}")
                 continue
@@ -160,11 +153,80 @@ class SearchEngine:
                 seen.add(result)
                 unique_results.append(result)
         
-        logger.info(f"📧 Found {len(unique_results):,} clean email:pass (NO URLs) for '{query}'")
+        logger.info(f"📧 Found {len(unique_results):,} CLEAN email:pass (NO URLs) for '{query}'")
         return len(unique_results), unique_results
     
+    def extract_clean_email_pass_no_url(self, line: str) -> List[Tuple[str, str]]:
+        """
+        Extract CLEAN email:password pairs from a line
+        REMOVES ALL URLs completely - returns only email:password
+        """
+        pairs = []
+        
+        # Remove URLs and protocol prefixes
+        # Remove http://, https://, ftp:// and any domain before email
+        line_clean = re.sub(r'https?://[^\s]+', '', line, flags=re.IGNORECASE)
+        line_clean = re.sub(r'ftp://[^\s]+', '', line_clean, flags=re.IGNORECASE)
+        line_clean = re.sub(r'www\.[^\s]+', '', line_clean, flags=re.IGNORECASE)
+        
+        # Remove common URL patterns before email
+        line_clean = re.sub(r'^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\s*[:|;]', '', line_clean)
+        
+        # Now extract email:password pairs from cleaned line
+        # Pattern for email:password (email must have @ and .)
+        email_pattern = r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})'
+        
+        # Find all emails in the cleaned line
+        emails = re.findall(email_pattern, line_clean, re.IGNORECASE)
+        
+        for email in emails:
+            # Find the email in the original position
+            email_start = line.find(email)
+            if email_start == -1:
+                continue
+                
+            # Look for password after the email
+            after_email = line[email_start + len(email):]
+            
+            # Find the next non-separator content as password
+            password_match = re.search(r'^[^:|\s]*[:|\s]+([^\s]+)', after_email)
+            if password_match:
+                password = password_match.group(1)
+                # Make sure password is not a URL or domain
+                if not (password.startswith('http') or 
+                       '.' in password and len(password.split('.')[-1]) in [2, 3, 4] and
+                       not any(char.isdigit() for char in password.split('.')[-1])):
+                    pairs.append((email, password))
+            else:
+                # Try alternative extraction
+                parts = re.split(r'[:|;\s]', after_email, 1)
+                if len(parts) > 1 and parts[1].strip():
+                    password = parts[1].strip()
+                    if not (password.startswith('http') or 
+                           '.' in password and len(password.split('.')[-1]) in [2, 3, 4]):
+                        pairs.append((email, password))
+        
+        # If no pairs found with pattern, try manual parsing
+        if not pairs:
+            # Split by common separators
+            parts = re.split(r'[:|;]', line)
+            for i in range(len(parts) - 1):
+                if '@' in parts[i] and '.' in parts[i]:
+                    email_candidate = parts[i].strip()
+                    password_candidate = parts[i + 1].strip() if i + 1 < len(parts) else ""
+                    
+                    # Validate email
+                    if re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email_candidate):
+                        # Check if email_candidate is not a URL
+                        if not (email_candidate.startswith('http') or '://' in email_candidate):
+                            # Check if password is not empty and not a URL
+                            if password_candidate and not password_candidate.startswith('http'):
+                                pairs.append((email_candidate, password_candidate))
+        
+        return pairs
+    
     def search_email_only(self, email: str) -> Tuple[int, List[str]]:
-        """Search for specific email addresses only"""
+        """Search for specific email addresses only - NO LIMIT"""
         results = []
         email_lower = email.lower().strip()
         
@@ -172,7 +234,7 @@ class SearchEngine:
             try:
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                     for line in f:
-                        line = strip()
+                        line = line.strip()
                         if not line:
                             continue
                         
@@ -197,7 +259,7 @@ class SearchEngine:
         return len(unique_results), unique_results
     
     def search_login(self, login: str) -> Tuple[int, List[str]]:
-        """Search for login (username) - returns login:pass"""
+        """Search for login (username) - returns login:pass - NO LIMIT"""
         results = []
         login_lower = login.lower().strip()
         
@@ -219,6 +281,7 @@ class SearchEngine:
                             if (login_lower in username.lower() and 
                                 '@' not in username and 
                                 '://' not in username and
+                                '.' not in username.split('/')[0] if '/' in username else True and
                                 password and 
                                 len(password) > 0):
                                 results.append(f"{username}:{password}")
@@ -229,7 +292,7 @@ class SearchEngine:
         return len(results), results
     
     def search_password(self, password: str) -> Tuple[int, List[str]]:
-        """Search for password - returns login:pass or email:pass"""
+        """Search for password - returns login:pass or email:pass - NO LIMIT"""
         results = []
         pass_lower = password.lower().strip()
         
@@ -257,14 +320,10 @@ class SearchEngine:
         return len(results), results
     
     def search_dni_domain_only_dni_pass(self, domain: str) -> Tuple[int, List[str]]:
-        """
-        Search for DNI:password combos ONLY - NO emails
-        Example: /dni google.com finds ONLY DNI:pass patterns
-        """
+        """Search for DNI:password combos ONLY - NO emails - NO LIMIT"""
         results = []
         domain_lower = domain.lower().strip()
         
-        # Clean domain (remove @ if present)
         if domain_lower.startswith('@'):
             domain_lower = domain_lower[1:]
         
@@ -288,7 +347,9 @@ class SearchEngine:
                             for dni, password in matches:
                                 # Asegurarnos que no sea parte de un email
                                 if '@' not in dni and '@' not in password:
-                                    results.append(f"{dni.upper()}:{password}")
+                                    # Verificar que el DNI no esté en un email
+                                    if not re.search(rf'{dni}@', line_lower):
+                                        results.append(f"{dni.upper()}:{password}")
             except Exception as e:
                 logger.error(f"Error in {file_path}: {e}")
                 continue
@@ -302,35 +363,6 @@ class SearchEngine:
                 unique_results.append(result)
         
         return len(unique_results), unique_results
-    
-    def extract_all_email_pass_pairs(self, line: str) -> List[Tuple[str, str]]:
-        """
-        Extract ALL email:password pairs from a line
-        Returns list of (email, password) tuples
-        """
-        pairs = []
-        
-        # Pattern for email:password
-        email_pass_pattern = r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\s*[:|;]\s*([^\s]+)'
-        
-        # Find all email:password pairs
-        matches = re.findall(email_pass_pattern, line, re.IGNORECASE)
-        for email, password in matches:
-            pairs.append((email, password))
-        
-        # If no pattern found, try manual parsing
-        if not pairs:
-            parts = re.split(r'[:|;]', line)
-            for i in range(len(parts) - 1):
-                if '@' in parts[i] and '.' in parts[i]:
-                    email = parts[i].strip()
-                    password = parts[i + 1].strip()
-                    
-                    # Basic email validation
-                    if re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
-                        pairs.append((email, password))
-        
-        return pairs
     
     def get_stats(self) -> Dict:
         total_lines = 0
@@ -364,7 +396,7 @@ class SearchEngine:
             return False, str(e)
 
 # ============================================================================
-# CREDIT SYSTEM - COMPLETE
+# CREDIT SYSTEM - SIN CAMBIOS
 # ============================================================================
 
 class CreditSystem:
@@ -688,7 +720,7 @@ class CreditSystem:
             return dict(result) if result else None
 
 # ============================================================================
-# MAIN BOT - COMPLETE WITH ALL COMMANDS
+# MAIN BOT - FIXED: ALL RESULTS, NO LIMITS
 # ============================================================================
 
 class ULPBot:
@@ -763,9 +795,9 @@ class ULPBot:
             f"• Lines: {stats['total_lines']:,}\n"
             f"• Size: {stats['total_size_mb']:,.1f} MB\n\n"
             f"<b>⚠️ IMPORTANT:</b>\n"
-            f"• ALL results in ONE file\n"
-            f"• Large files sent as ZIP\n"
-            f"• Email:Pass format removes URLs\n\n"
+            f"• <b>ALL</b> results in ONE file\n"
+            f"• <b>NO LIMIT</b> on number of results\n"
+            f"• Email:Pass format = <b>NO URLs</b>\n\n"
             f"Use <b>/search</b> to start!"
         )
         
@@ -788,7 +820,7 @@ class ULPBot:
                 "<code>/search user@gmail.com</code>\n"
                 "<code>/search @hotmail.com</code>\n\n"
                 "Then choose format!\n\n"
-                "<b>📁 ALL RESULTS IN ONE FILE</b>"
+                "<b>📁 ALL RESULTS IN ONE FILE - NO LIMITS</b>"
             )
             return
         
@@ -806,10 +838,10 @@ class ULPBot:
         await update.message.reply_html(
             f"🔍 <b>Search Query:</b> <code>{self.escape_html(query)}</code>\n\n"
             f"<b>Choose format:</b>\n"
-            f"1. <b>Email:Pass Only</b> - Clean format (URLs removed)\n"
+            f"1. <b>Email:Pass Only</b> - Clean format (NO URLs)\n"
             f"2. <b>Full Lines</b> - Complete lines with URLs\n\n"
             f"<i>Your credits: {self.credit_system.get_user_credits(user.id)}</i>\n\n"
-            f"<b>📁 Results delivered in ONE file</b>",
+            f"<b>📁 Results delivered in ONE file - ALL results included</b>",
             reply_markup=reply_markup
         )
     
@@ -890,7 +922,7 @@ class ULPBot:
         await self.perform_dni_search(update, user.id, domain)
     
     # ============================================================================
-    # USER COMMANDS
+    # USER COMMANDS (sin cambios)
     # ============================================================================
     
     async def mycredits_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -989,7 +1021,7 @@ class ULPBot:
         await update.message.reply_html(message)
     
     # ============================================================================
-    # INFO COMMANDS
+    # INFO COMMANDS (sin cambios)
     # ============================================================================
     
     async def info_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1037,7 +1069,7 @@ class ULPBot:
             "/dni <domain> - Find DNI:password ONLY (no emails)\n\n"
             
             "<b>📋 FORMATS FOR /search:</b>\n"
-            "• Email:Pass Only - Clean format (URLs removed)\n"
+            "• Email:Pass Only - Clean format (NO URLs)\n"
             "• Full Lines - Complete lines with URLs\n\n"
             
             "<b>💰 PERSONAL COMMANDS:</b>\n"
@@ -1060,10 +1092,10 @@ class ULPBot:
             "/upload - Upload ULP file\n\n"
             
             "<b>📁 RESULT DELIVERY:</b>\n"
-            "• ALL results in ONE file\n"
+            "• <b>ALL</b> results in ONE file\n"
+            "• <b>NO LIMIT</b> on results\n"
             "• Small files → .txt\n"
-            "• Large files → .zip\n"
-            "• No limit on results\n\n"
+            "• Large files → .zip\n\n"
             
             "<b>💡 TIPS:</b>\n"
             "• Use specific terms for better results\n"
@@ -1076,7 +1108,7 @@ class ULPBot:
         await update.message.reply_html(help_text)
     
     # ============================================================================
-    # ADMIN COMMANDS
+    # ADMIN COMMANDS (sin cambios)
     # ============================================================================
     
     async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1338,11 +1370,11 @@ class ULPBot:
             await update.message.reply_html(f"❌ Upload error: {str(e)}")
     
     # ============================================================================
-    # SEARCH FUNCTIONALITY - SINGLE FILE OUTPUT
+    # SEARCH FUNCTIONALITY - FIXED: ALL RESULTS, NO LIMITS
     # ============================================================================
     
     async def perform_search_with_format(self, update: Update, user_id: int, query: str, format_type: str):
-        """Perform search and send ALL results in ONE file"""
+        """Perform search and send ALL results in ONE file - NO LIMITS"""
         if not self.credit_system.has_enough_credits(user_id):
             await self.send_no_credits_message(update, user_id)
             return
@@ -1363,6 +1395,8 @@ class ULPBot:
                 count, results = self.search_engine.search_all_formats(query)
                 result_type = "full lines"
                 description = "Complete database entries (with URLs)"
+            
+            logger.info(f"📊 Found {count:,} results for '{query}' with format '{format_type}'")
             
             success = self.credit_system.use_credits(user_id, format_type, query, count)
             
@@ -1385,10 +1419,11 @@ class ULPBot:
             
             await query_msg.edit_text(
                 f"✅ Found: {count:,} results\n"
-                f"📁 Creating file...\n"
+                f"📁 Creating file with ALL results...\n"
                 f"⏳ Please wait..."
             )
             
+            # Create file with ALL results
             results_text = "\n".join(results)
             file_content = f"""SEARCH RESULTS - {BOT_NAME}
 Query: {query}
@@ -1401,7 +1436,7 @@ Total Results: {count:,}
             file_size_bytes = len(file_content.encode('utf-8'))
             file_size_mb = file_size_bytes / (1024 * 1024)
             
-            logger.info(f"📊 File size: {file_size_mb:.2f} MB ({file_size_bytes:,} bytes)")
+            logger.info(f"📊 File size: {file_size_mb:.2f} MB ({file_size_bytes:,} bytes) for {count:,} results")
             
             if file_size_mb <= 45:
                 file_obj = io.BytesIO(file_content.encode('utf-8'))
@@ -1417,7 +1452,7 @@ Total Results: {count:,}
                         f"<b>Format:</b> {description}\n"
                         f"<b>Daily credits left:</b> {daily_credits}/2\n"
                         f"<b>Total credits:</b> {self.credit_system.get_user_credits(user_id)}\n\n"
-                        f"<i>All results in one file</i>"
+                        f"<i>ALL results in one file</i>"
                     ),
                     parse_mode='HTML'
                 )
@@ -1426,16 +1461,19 @@ Total Results: {count:,}
             else:
                 await query_msg.edit_text(
                     f"📦 File is large ({file_size_mb:.1f} MB)\n"
-                    f"Creating ZIP archive..."
+                    f"Creating ZIP archive with ALL results..."
                 )
                 
                 zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                    max_lines_per_file = 1000000
+                    # Split into multiple files inside ZIP if needed
+                    max_lines_per_file = 1000000  # ~20-30MB per file
                     
                     if count <= max_lines_per_file:
+                        # Single file inside ZIP
                         zip_file.writestr(f"{query}_ALL_RESULTS.txt", file_content)
                     else:
+                        # Multiple files inside ZIP
                         total_files = (count + max_lines_per_file - 1) // max_lines_per_file
                         for i in range(total_files):
                             start_idx = i * max_lines_per_file
@@ -1468,7 +1506,7 @@ Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                         f"<b>File size:</b> {file_size_mb:.1f} MB\n"
                         f"<b>Daily credits left:</b> {daily_credits}/2\n"
                         f"<b>Total credits:</b> {self.credit_system.get_user_credits(user_id)}\n\n"
-                        f"<i>Results sent as ZIP file (too large for Telegram)</i>"
+                        f"<i>ALL results in ZIP file (too large for Telegram)</i>"
                     ),
                     parse_mode='HTML'
                 )
@@ -1480,7 +1518,7 @@ Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             await query_msg.edit_text(f"❌ Error: {str(e)}")
     
     async def perform_specific_search(self, update: Update, user_id: int, search_type: str, query: str):
-        """Perform specific search (email, login, password)"""
+        """Perform specific search (email, login, password) - ALL RESULTS"""
         if not self.credit_system.has_enough_credits(user_id):
             await self.send_no_credits_message(update, user_id)
             return
@@ -1488,7 +1526,8 @@ Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         msg = await update.message.reply_html(
             f"🔍 Searching for: <code>{self.escape_html(query)}</code>\n"
             f"Type: {search_type.capitalize()}\n"
-            f"⏳ Please wait..."
+            f"⏳ Collecting ALL results...",
+            parse_mode='HTML'
         )
         
         try:
@@ -1504,6 +1543,8 @@ Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             else:
                 await msg.edit_text("❌ Invalid search type")
                 return
+            
+            logger.info(f"📊 Found {count:,} results for '{query}' with type '{search_type}'")
             
             success = self.credit_system.use_credits(user_id, search_type, query, count)
             
@@ -1526,15 +1567,16 @@ Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             
             await msg.edit_text(
                 f"✅ Found: {count:,} results\n"
-                f"📁 Creating file...\n"
+                f"📁 Creating file with ALL results...\n"
                 f"⏳ Please wait..."
             )
             
+            # Create file with ALL results
             results_text = "\n".join(results)
             file_content = f"""SEARCH RESULTS - {BOT_NAME}
 Type: {search_type.capitalize()}
 Query: {query}
-Date: {datetime.now().strftime('%Y-%m-d %H:%M:%S')}
+Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 Total Results: {count:,}
 
 {results_text}"""
@@ -1556,7 +1598,7 @@ Total Results: {count:,}
                         f"<b>Results:</b> {count:,}\n"
                         f"<b>Daily credits left:</b> {daily_credits}/2\n"
                         f"<b>Total credits:</b> {self.credit_system.get_user_credits(user_id)}\n\n"
-                        f"<i>All results in one file</i>"
+                        f"<i>ALL results in one file</i>"
                     ),
                     parse_mode='HTML'
                 )
@@ -1564,7 +1606,7 @@ Total Results: {count:,}
             else:
                 zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                    zip_file.writestr(f"{search_type}_{query}_results.txt", file_content)
+                    zip_file.writestr(f"{search_type}_{query}_ALL_RESULTS.txt", file_content)
                 
                 zip_buffer.seek(0)
                 zip_filename = f"{search_type}_{query}_{count}_results.zip"
@@ -1579,7 +1621,7 @@ Total Results: {count:,}
                         f"<b>Results:</b> {count:,}\n"
                         f"<b>File size:</b> {file_size_mb:.1f} MB\n"
                         f"<b>Daily credits left:</b> {daily_credits}/2\n\n"
-                        f"<i>Results sent as ZIP file</i>"
+                        f"<i>ALL results in ZIP file</i>"
                     ),
                     parse_mode='HTML'
                 )
@@ -1590,19 +1632,21 @@ Total Results: {count:,}
             await msg.edit_text(f"❌ Error: {str(e)}")
     
     async def perform_dni_search(self, update: Update, user_id: int, domain: str):
-        """Search for DNI:password combos ONLY - NO emails"""
+        """Search for DNI:password combos ONLY - ALL RESULTS"""
         if not self.credit_system.has_enough_credits(user_id):
             await self.send_no_credits_message(update, user_id)
             return
         
         msg = await update.message.reply_html(
             f"🔍 Searching DNI:password from: <code>{self.escape_html(domain)}</code>\n"
-            f"⏳ Looking for Spanish ID combos (NO emails)..."
+            f"⏳ Collecting ALL results (NO emails)..."
         )
         
         try:
             count, results = self.search_engine.search_dni_domain_only_dni_pass(domain)
             result_type = "DNI:password combos (NO emails)"
+            
+            logger.info(f"📊 Found {count:,} DNI results for '{domain}'")
             
             success = self.credit_system.use_credits(user_id, 'dni', domain, count)
             
@@ -1624,10 +1668,11 @@ Total Results: {count:,}
             
             await msg.edit_text(
                 f"✅ Found: {count:,} DNI:password combos\n"
-                f"📁 Creating file...\n"
+                f"📁 Creating file with ALL results...\n"
                 f"⏳ Please wait..."
             )
             
+            # Create file with ALL results
             results_text = "\n".join(results)
             file_content = f"""DNI SEARCH RESULTS - {BOT_NAME}
 Domain: {domain}
@@ -1654,7 +1699,7 @@ Total Results: {count:,}
                         f"<b>Note:</b> NO emails included\n"
                         f"<b>Daily credits left:</b> {daily_credits}/2\n"
                         f"<b>Total credits:</b> {self.credit_system.get_user_credits(user_id)}\n\n"
-                        f"<i>All results in one file</i>"
+                        f"<i>ALL results in one file</i>"
                     ),
                     parse_mode='HTML'
                 )
@@ -1662,7 +1707,7 @@ Total Results: {count:,}
             else:
                 zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                    zip_file.writestr(f"dni_{domain}_results.txt", file_content)
+                    zip_file.writestr(f"dni_{domain}_ALL_RESULTS.txt", file_content)
                 
                 zip_buffer.seek(0)
                 zip_filename = f"dni_{domain}_{count}_results.zip"
@@ -1677,7 +1722,7 @@ Total Results: {count:,}
                         f"<b>Note:</b> NO emails included\n"
                         f"<b>File size:</b> {file_size_mb:.1f} MB\n"
                         f"<b>Daily credits left:</b> {daily_credits}/2\n\n"
-                        f"<i>Results sent as ZIP file</i>"
+                        f"<i>ALL results in ZIP file</i>"
                     ),
                     parse_mode='HTML'
                 )
@@ -1705,7 +1750,7 @@ Total Results: {count:,}
             await update.message.reply_html(message)
     
     # ============================================================================
-    # BUTTON HANDLER
+    # BUTTON HANDLER (sin cambios)
     # ============================================================================
     
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1724,7 +1769,7 @@ Total Results: {count:,}
                 "<code>/search user@gmail.com</code>\n"
                 "<code>/search @hotmail.com</code>\n\n"
                 "Then choose format!\n\n"
-                "<b>📁 ALL RESULTS IN ONE FILE</b>",
+                "<b>📁 ALL RESULTS IN ONE FILE - NO LIMITS</b>",
                 parse_mode='HTML'
             )
             
@@ -1764,14 +1809,14 @@ Total Results: {count:,}
                 "/search [query] - Main search command\n\n"
                 
                 "<b>📋 FORMATS:</b>\n"
-                "• <b>Email:Pass Only</b> - Clean format (URLs removed)\n"
+                "• <b>Email:Pass Only</b> - Clean format (NO URLs)\n"
                 "• <b>Full Lines</b> - Complete lines with URLs\n\n"
                 
                 "<b>📁 DELIVERY:</b>\n"
-                "• <b>ALL results in ONE file</b>\n"
-                "• Small files sent as .txt\n"
-                "• Large files sent as .zip\n"
-                "• No limit on results\n\n"
+                "• <b>ALL</b> results in ONE file\n"
+                "• <b>NO LIMIT</b> on results\n"
+                "• Small files → .txt\n"
+                "• Large files → .zip\n\n"
                 
                 "<b>💰 CREDITS:</b>\n"
                 "• 2 free credits daily\n"
@@ -1937,7 +1982,7 @@ def run():
     logger.info(f"🌐 Flask server running on port {PORT}")
     
     # Start the bot
-    logger.info("🤖 Bot started with ALL commands")
+    logger.info("🤖 Bot started with ALL commands - FIXED VERSION")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
